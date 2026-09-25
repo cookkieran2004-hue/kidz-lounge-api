@@ -130,13 +130,14 @@ async function placeOnCalendar(q, reqRow, providerName, link) {
 // PTO/UPTO hours, and mark it approved. `q` is a client inside the
 // caller's transaction, so a failure part-way leaves nothing behind.
 async function applyApproval(q, reqRow, reviewerUsername) {
-  const staffRes = await q.query('SELECT provider_name FROM "Staff" WHERE username=$1', [reqRow.username]);
+  const staffRes = await q.query('SELECT username, provider_name, first_name, last_name, preferred_name FROM "Staff" WHERE username=$1', [reqRow.username]);
   const providerName = staffRes.rows[0]?.provider_name;
+  const requesterName = displayNameFor(staffRes.rows[0] || { username: reqRow.username });
 
   if (providerName) {
     const providerCheck = await q.query('SELECT 1 FROM "Providers" WHERE "Name"=$1', [providerName]);
     if (!providerCheck.rows[0]) {
-      throw new TimeOffError(400, `${reqRow.username}'s account is linked to the provider name "${providerName}", but no provider record matches that name exactly. Fix the Provider Link on their Staff account, then approve again.`);
+      throw new TimeOffError(400, `${requesterName}'s account is linked to the provider name "${providerName}", but no provider record matches that name exactly. Fix the Provider Link on their Staff account, then approve again.`);
     }
   }
 
@@ -148,7 +149,7 @@ async function applyApproval(q, reqRow, reviewerUsername) {
   // into the hour-based math below and either crash or silently create
   // garbage data. Caught here with a clear, actionable message instead.
   if (reqRow.is_balance_type && (!reqRow.start_time || !reqRow.end_time)) {
-    throw new TimeOffError(400, `This request was submitted before the PTO/UPTO redesign and is missing the exact times the new system requires. It can't be approved as-is -- deny it and ask ${reqRow.username} to resubmit under the current form.`);
+    throw new TimeOffError(400, `This request was submitted before the PTO/UPTO redesign and is missing the exact times the new system requires. It can't be approved as-is -- deny it and ask ${requesterName} to resubmit under the current form.`);
   }
 
   const link = await hasBlockLinkColumn(q);

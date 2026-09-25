@@ -4,16 +4,24 @@ const { HttpError, syncLinkedProvider, assertProviderNotLinkedElsewhere } = requ
 const { verifyAdminPassword } = require('../lib/auth');
 const { displayNameFor } = require('../lib/utils');
 
-async function handle({ path, method, body, db, currentUser }) {
+async function handle({ path, method, qs, body, db, currentUser }) {
   // Lightweight, non-admin-gated staff list -- any staff member can edit a
   // patient's Case Manager, so the dropdown that populates it needs to be
   // available to everyone, not just admins (unlike /auth/users below, which
   // is full account management and stays admin-only).
+  // ?include_archived=true adds archived accounts (with `archived: true`) --
+  // not for pickers, but for turning a stored username back into a name,
+  // since a comment or upload by someone who has since left should still
+  // show who they were.
   if (path === '/staff/directory' && method === 'GET') {
+    const includeArchived = qs.include_archived === 'true';
     const result = await db.query(
-      `SELECT username, first_name, middle_name, last_name, preferred_name FROM "Staff" WHERE archived = false ORDER BY username`
+      `SELECT username, first_name, middle_name, last_name, preferred_name, archived FROM "Staff" WHERE $1 OR archived = false ORDER BY username`,
+      [includeArchived]
     );
-    const directory = result.rows.map(s => ({ username: s.username, display_name: displayNameFor(s) }));
+    const directory = result.rows.map(s => ({
+      username: s.username, display_name: displayNameFor(s), ...(includeArchived ? { archived: !!s.archived } : {}),
+    }));
     return json(200, directory);
   }
 
