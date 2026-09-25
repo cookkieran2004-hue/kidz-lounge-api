@@ -1,0 +1,45 @@
+name: Deploy AWS Lambda
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-lambda
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for OIDC authentication
+      contents: read  # Required to check out the repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # No build step: bundle the handler, its source and production deps.
+      - name: Package function
+        run: |
+          mkdir -p dist
+          cp index.js package.json package-lock.json dist/
+          cp -r lib routes dist/
+          npm ci --omit=dev --prefix dist
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy Lambda Function
+        uses: aws-actions/aws-lambda-deploy@v1
+        with:
+          function-name: ${{ vars.LAMBDA_FUNCTION_NAME }}
+          code-artifacts-dir: ./dist
