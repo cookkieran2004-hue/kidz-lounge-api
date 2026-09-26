@@ -19,6 +19,7 @@ const { CORS_HEADERS, json } = require('./lib/http');
 const { JWT_SECRET, handleLogin, handleSetPassword } = require('./lib/auth');
 const { runComplianceCheck } = require('./lib/complianceCheck');
 const { runTimeOffAccrual } = require('./lib/timeOffAccrual');
+const { runWeeklyPtoAccrual } = require('./lib/ptoAccrual');
 
 const staffRoutes = require('./routes/staff');
 const providerRoutes = require('./routes/providers');
@@ -55,6 +56,12 @@ exports.handler = async (event) => {
 
     if (event.job === 'time-off-accrual') {
       await runTimeOffAccrual(db);
+      return { statusCode: 200 };
+    }
+
+    // Sundays: PTO earned from the hours worked Monday-Friday.
+    if (event.job === 'pto-weekly-accrual') {
+      await runWeeklyPtoAccrual(db);
       return { statusCode: 200 };
     }
 

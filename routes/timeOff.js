@@ -1,16 +1,22 @@
 const { json } = require('../lib/http');
 const { displayNameFor } = require('../lib/utils');
 const { hasAgendaTable, hasCommentsTable, getAgenda, setAgenda, getMeetingComments, setMeetingComments } = require('../lib/meetingAgendas');
+const {
+  PTO_RATE, PTO_BALANCE_CAP, PTO_CARRYOVER_MAX, POLICY_START,
+  chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, mondayOf, addDays, round2,
+} = require('../lib/workSchedule');
+const { adjustBalance, hasLedgerTable } = require('../lib/ptoAccrual');
+const { UPTO_MONTHLY_HOURS } = require('../lib/timeOffAccrual');
 
 const BALANCE_TYPES = new Set(['PTO', 'UPTO']);
 const BALANCE_NEUTRAL_TYPES = new Set(['Lunch', 'Meeting', 'Unavailable', 'Other']);
 const ALL_TYPES = new Set([...BALANCE_TYPES, ...BALANCE_NEUTRAL_TYPES]);
 
-// Straightforward duration in hours between two exact datetimes -- not a
-// business-hours calculation. A multi-day span counts every hour in
-// between, nights and weekends included. If overnight/non-work hours
-// should be excluded from a multi-day request, that's a different, bigger
-// calculation this does not attempt.
+// Straightforward duration in hours between two exact datetimes, nights and
+// weekends included. No longer what PTO/UPTO costs -- that's the scheduled
+// hours a request covers (chargeHoursFor in lib/workSchedule.js), stored as
+// charged_hours. This is only the refund for older requests approved before
+// charged_hours existed, which were deducted this way.
 function hoursBetween(startDate, startTime, endDate, endTime) {
   const start = new Date(`${startDate}T${startTime}`);
   const end = new Date(`${endDate}T${endTime}`);
@@ -73,6 +79,39 @@ const hasReplacesColumn = (db) => hasColumn(db, 'TimeOffRequests', 'replaces_req
 // 2026-09-27: shared meetings + calendar blocks remembering their entry.
 const hasAttendeesColumn = (db) => hasColumn(db, 'TimeOffRequests', 'attendees');
 const hasBlockLinkColumn = (db) => hasColumn(db, 'Out_of_Office', 'time_off_request_id');
+// 2026-10-04: weekly PTO accrual -- what a request costs in scheduled hours.
+// Unlike the checks above, a "no" isn't remembered, so a warm Lambda starts
+// storing charged hours as soon as the migration has run.
+let chargedColumnExists = false;
+async function hasChargedColumn(db) {
+  if (chargedColumnExists) return true;
+  const r = await db.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name='TimeOffRequests' AND column_name='charged_hours'`
+  ).catch(() => ({ rows: [] }));
+  chargedColumnExists = r.rows.length > 0;
+  return chargedColumnExists;
+}
+
+// What an approved request took off the balance: its charged hours, or the
+// clock hours older requests were deducted before charged_hours existed.
+function hoursTaken(r) {
+  return r.charged_hours !== null && r.charged_hours !== undefined
+    ? Number(r.charged_hours)
+    : hoursBetween(r.start_date, r.start_time, r.end_date, r.end_time);
+}
+const whenLabel = (r) => (r.start_date === r.end_date ? r.start_date : `${r.start_date} to ${r.end_date}`);
+
+// Two weeks' worth of PTO in a row at most (see consecutivePtoCheck).
+async function assertConsecutivePtoLimit(db, username, fields, excludeIds = []) {
+  if (fields.request_type !== 'PTO') return;
+  const check = await consecutivePtoCheck(db, username, {
+    request_type: 'PTO', is_balance_type: true,
+    start_date: fields.start_date, end_date: fields.end_date, start_time: fields.start_time, end_time: fields.end_time,
+  }, { excludeIds });
+  if (check?.over) {
+    throw new TimeOffError(400, `PTO can cover at most two weeks in a row -- ${check.limit} hours on this schedule. Together with the PTO next to it, this would be ${check.hours} hours. Request the extra days as UPTO instead (unpaid, with an admin's approval).`, { consecutivePto: check });
+  }
+}
 const SHARED_MEETINGS_MIGRATION = 'migrations/2026-09-27_shared_meetings.sql';
 
 // extra: { replaces_request_id, attendees } -- included only when given.
@@ -88,6 +127,7 @@ async function insertRequest(q, withCreatedBy, username, createdBy, f, extra = {
   if (withCreatedBy) { cols.push('created_by'); vals.push(createdBy); }
   if (extra.replaces_request_id !== null && extra.replaces_request_id !== undefined) { cols.push('replaces_request_id'); vals.push(String(extra.replaces_request_id)); }
   if (extra.attendees !== undefined) { cols.push('attendees'); vals.push(extra.attendees); }
+  if (f.isBalanceType && await hasChargedColumn(q)) { cols.push('charged_hours'); vals.push(await chargeHoursFor(q, username, { ...f, is_balance_type: true })); }
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(',');
   const result = await q.query(`INSERT INTO "TimeOffRequests" (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`, vals);
   return result.rows[0];
@@ -180,15 +220,15 @@ async function applyApproval(q, reqRow, reviewerUsername) {
 
   let newBalance = null;
   if (reqRow.is_balance_type) {
-    const hoursUsed = hoursBetween(reqRow.start_date, reqRow.start_time, reqRow.end_date, reqRow.end_time);
-    const current = await currentBalance(q, reqRow.username, reqRow.request_type);
-    newBalance = current - hoursUsed;
-    await q.query(
-      `INSERT INTO "TimeOffBalances" (username, balance_type, balance_hours)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (username, balance_type) DO UPDATE SET balance_hours = $3, updated_at = now()`,
-      [reqRow.username, reqRow.request_type, newBalance]
-    );
+    // Charged at the scheduled hours it covers, worked out now (the schedule
+    // may have changed since it was filed) and stored so a refund matches.
+    const hoursUsed = await chargeHoursFor(q, reqRow.username, reqRow);
+    if (await hasChargedColumn(q)) await q.query('UPDATE "TimeOffRequests" SET charged_hours=$1 WHERE id=$2', [hoursUsed, reqRow.id]);
+    const { after } = await adjustBalance(q, {
+      username: reqRow.username, type: reqRow.request_type, delta: -hoursUsed, kind: 'used',
+      entryDate: reqRow.start_date, requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)}`, createdBy: reviewerUsername,
+    });
+    newBalance = after;
   }
 
   const updateRes = await q.query(
@@ -251,12 +291,10 @@ async function undoApproval(q, reqRow, keepBefore = null) {
         );
       }
     }
-    const hoursUsed = hoursBetween(reqRow.start_date, reqRow.start_time, reqRow.end_date, reqRow.end_time);
-    await q.query(
-      `UPDATE "TimeOffBalances" SET balance_hours = balance_hours + $1, updated_at = now()
-       WHERE username=$2 AND balance_type=$3`,
-      [hoursUsed, reqRow.username, reqRow.request_type]
-    );
+    await adjustBalance(q, {
+      username: reqRow.username, type: reqRow.request_type, delta: hoursTaken(reqRow), kind: 'refund',
+      entryDate: todayStr(), requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)} removed or changed`,
+    });
   } else if (reqRow.resulting_ooo_id) {
     await q.query('DELETE FROM "Out_of_Office" WHERE id=$1', [reqRow.resulting_ooo_id]);
   }
@@ -474,6 +512,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     // admin). Other types keep the linked change flow above.
     const cancelsOriginal = !!original && BALANCE_TYPES.has(original.request_type);
     if (cancelsOriginal) delete extra.replaces_request_id;
+
+    try {
+      await assertConsecutivePtoLimit(db, targetUsername || currentUser.username, fields, original ? [original.id] : []);
+    } catch (err) {
+      if (err instanceof TimeOffError) return json(err.status, { error: err.message, ...err.extra });
+      throw err;
+    }
     const cancelOriginal = async (client) => {
       const locked = (await client.query('SELECT * FROM "TimeOffRequests" WHERE id=$1 FOR UPDATE', [original.id])).rows[0];
       if (!locked || locked.status !== 'approved') throw new TimeOffError(409, 'The entry you are changing has already been changed or removed. Refresh and try again.');
@@ -500,10 +545,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
 
     if (isBalanceType && !confirm_negative_balance) {
-      const hoursRequested = hoursBetween(start_date, start_time, end_date, end_time);
+      const hoursRequested = await chargeHoursFor(db, targetUsername, { ...fields, is_balance_type: true });
       // A change gives back the original's hours first (same balance type).
-      const refund = original && original.is_balance_type && original.request_type === request_type
-        ? hoursBetween(original.start_date, original.start_time, original.end_date, original.end_time) : 0;
+      const refund = original && original.is_balance_type && original.request_type === request_type ? hoursTaken(original) : 0;
       const current = await currentBalance(db, targetUsername, request_type) + refund;
       const resulting = current - hoursRequested;
       if (resulting < 0) {
@@ -834,6 +878,16 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (request_type === 'Other' && !(notes || '').trim()) {
       return json(400, { error: 'Please specify what "Other" is for.' });
     }
+    try {
+      await assertConsecutivePtoLimit(db, existingRes.rows[0].username, { request_type, start_date, end_date, start_time, end_time }, [id]);
+    } catch (err) {
+      if (err instanceof TimeOffError) return json(err.status, { error: err.message, ...err.extra });
+      throw err;
+    }
+    if (isBalanceType && await hasChargedColumn(db)) {
+      const charge = await chargeHoursFor(db, existingRes.rows[0].username, { is_balance_type: true, start_date, end_date, start_time, end_time });
+      await db.query('UPDATE "TimeOffRequests" SET charged_hours=$1 WHERE id=$2', [charge, id]);
+    }
     if (await hasAttendeesColumn(db)) {
       try {
         const attendees = request_type === 'Meeting' ? await cleanAttendees(db, body.attendees, existingRes.rows[0].username) : [];
@@ -896,14 +950,71 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!username || !BALANCE_TYPES.has(balance_type) || balance_hours === undefined) {
       return json(400, { error: 'username, balance_type, and balance_hours are required.' });
     }
-    const result = await db.query(
-      `INSERT INTO "TimeOffBalances" (username, balance_type, balance_hours)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (username, balance_type) DO UPDATE SET balance_hours = $3, updated_at = now()
-       RETURNING *`,
-      [username, balance_type, balance_hours]
-    );
-    return json(200, result.rows[0]);
+    const value = Number(balance_hours);
+    if (Number.isNaN(value)) return json(400, { error: 'balance_hours must be a number.' });
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const { after } = await adjustBalance(client, {
+        username, type: balance_type, setTo: value, kind: 'adjustment', entryDate: todayStr(),
+        note: (body.note || '').trim() || 'Adjusted by an admin', createdBy: currentUser.username,
+      });
+      await client.query('COMMIT');
+      return json(200, { username, balance_type, balance_hours: after });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // What a PTO/UPTO span would cost in scheduled hours, for the request
+  // form. Your own; an admin can pass ?username=.
+  if (path === '/time-off/estimate' && method === 'GET') {
+    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const { start_date, end_date, start_time, end_time } = qs;
+    if (!start_date || !end_date || !start_time || !end_time) return json(400, { error: 'start_date, end_date, start_time and end_time are required.' });
+    if (end_date < start_date) return json(200, { hours: 0 });
+    const hours = await chargeHoursFor(db, targetUsername, { is_balance_type: true, start_date, end_date, start_time, end_time });
+    return json(200, { hours });
+  }
+
+  // Balance history, newest first. Your own; an admin can pass ?username=.
+  if (path === '/time-off/ledger' && method === 'GET') {
+    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    if (!(await hasLedgerTable(db))) return json(200, []);
+    const limit = Math.min(Number(qs.limit) || 60, 500);
+    const params = [targetUsername];
+    let sql = `SELECT id, balance_type, entry_date, kind, hours, balance_after, period_start, worked_hours, request_id, note, details, created_by, created_at
+               FROM "TimeOffLedger" WHERE username=$1`;
+    if (BALANCE_TYPES.has(qs.type)) { params.push(qs.type); sql += ` AND balance_type=$${params.length}`; }
+    params.push(limit);
+    sql += ` ORDER BY entry_date DESC, id DESC LIMIT $${params.length}`;
+    const result = await db.query(sql, params);
+    return json(200, result.rows.map(r => ({ ...r, hours: Number(r.hours), balance_after: Number(r.balance_after), worked_hours: r.worked_hours === null ? null : Number(r.worked_hours) })));
+  }
+
+  // The accrual rules as they apply to someone, for My time's forecast and
+  // the staff profile. Your own; an admin can pass ?username=.
+  if (path === '/time-off/policy' && method === 'GET') {
+    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const staff = await loadStaff(db, targetUsername);
+    if (!staff) return json(404, { error: 'No such staff account.' });
+    const today = todayStr();
+    const monday = mondayOf(today);
+    const schedule = await loadSchedule(db, staff, monday, addDays(monday, 6));
+    const weekly = weeklyScheduledHours(schedule, today);
+    return json(200, {
+      schedule_kind: schedule.kind,
+      weekly_scheduled_hours: weekly,
+      pto: {
+        rate: PTO_RATE, balance_cap: PTO_BALANCE_CAP, carryover_max: PTO_CARRYOVER_MAX, policy_start: POLICY_START,
+        estimated_weekly_credit: round2(weekly * PTO_RATE),
+        max_consecutive_hours: round2(2 * weekly),
+      },
+      upto: { monthly_hours: UPTO_MONTHLY_HOURS },
+    });
   }
 
   return null;
