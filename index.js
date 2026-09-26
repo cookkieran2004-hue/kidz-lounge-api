@@ -42,25 +42,41 @@ const ROUTE_MODULES = [
   oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes,
 ];
 
+// Which scheduled job an EventBridge event is for: its `job` (a rule with a
+// constant JSON input), or else the name of the rule that fired it. A
+// schedule added from the Lambda page's "Add trigger" always sends the plain
+// matched event -- no way to set an input there -- so naming the rule after
+// the job (e.g. "pto-weekly-accrual") is enough. Anything else is the chat
+// cleanup, as before.
+const SCHEDULED_JOBS = ['compliance-check', 'time-off-accrual', 'pto-weekly-accrual', 'chat-cleanup'];
+function scheduledJobFor(event) {
+  if (event.job) return event.job;
+  const ruleNames = (event.resources || []).map(arn => String(arn).split(':rule/').pop());
+  return ruleNames.find(name => SCHEDULED_JOBS.includes(name)) || null;
+}
+exports.scheduledJobFor = scheduledJobFor;
+
 exports.handler = async (event) => {
   // EventBridge scheduled trigger for the 72-hour chat cleanup job -- not an
   // HTTP request at all, so it's handled completely separately, before any
   // of the API Gateway-shaped routing below even looks at the event.
   if (event.source === 'aws.events') {
     const db = getPool();
+    const job = scheduledJobFor(event);
+    console.log(`Scheduled job: ${job || 'chat-cleanup (default)'}`);
 
-    if (event.job === 'compliance-check') {
+    if (job === 'compliance-check') {
       await runComplianceCheck(db);
       return { statusCode: 200 };
     }
 
-    if (event.job === 'time-off-accrual') {
+    if (job === 'time-off-accrual') {
       await runTimeOffAccrual(db);
       return { statusCode: 200 };
     }
 
     // Sundays: PTO earned from the hours worked Monday-Friday.
-    if (event.job === 'pto-weekly-accrual') {
+    if (job === 'pto-weekly-accrual') {
       await runWeeklyPtoAccrual(db);
       return { statusCode: 200 };
     }
