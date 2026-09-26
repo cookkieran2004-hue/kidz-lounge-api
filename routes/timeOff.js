@@ -5,7 +5,7 @@ const {
   PTO_RATE, PTO_BALANCE_CAP, PTO_CARRYOVER_MAX, POLICY_START,
   chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, mondayOf, addDays, round2,
 } = require('../lib/workSchedule');
-const { adjustBalance, hasLedgerTable } = require('../lib/ptoAccrual');
+const { adjustBalance, removeUsage, hasLedgerTable } = require('../lib/ptoAccrual');
 const { UPTO_MONTHLY_HOURS } = require('../lib/timeOffAccrual');
 
 const BALANCE_TYPES = new Set(['PTO', 'UPTO']);
@@ -291,10 +291,15 @@ async function undoApproval(q, reqRow, keepBefore = null) {
         );
       }
     }
-    await adjustBalance(q, {
-      username: reqRow.username, type: reqRow.request_type, delta: hoursTaken(reqRow), kind: 'refund',
-      entryDate: todayStr(), requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)} removed or changed`,
-    });
+    // Deleted or replaced: its deduction comes out of the history entirely.
+    // Only an older request with no history entry leaves a refund behind.
+    const removed = await removeUsage(q, { username: reqRow.username, type: reqRow.request_type, requestId: reqRow.id });
+    if (!removed) {
+      await adjustBalance(q, {
+        username: reqRow.username, type: reqRow.request_type, delta: hoursTaken(reqRow), kind: 'refund',
+        entryDate: todayStr(), requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)} removed or changed`,
+      });
+    }
   } else if (reqRow.resulting_ooo_id) {
     await q.query('DELETE FROM "Out_of_Office" WHERE id=$1', [reqRow.resulting_ooo_id]);
   }
@@ -992,7 +997,19 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     params.push(limit);
     sql += ` ORDER BY entry_date DESC, id DESC LIMIT $${params.length}`;
     const result = await db.query(sql, params);
-    return json(200, result.rows.map(r => ({ ...r, hours: Number(r.hours), balance_after: Number(r.balance_after), worked_hours: r.worked_hours === null ? null : Number(r.worked_hours) })));
+    // "Balance after" is worked back from today's balance in date order, so
+    // the history always adds up -- including after a deleted request's
+    // entry has been taken out of it. (Each row's stored balance_after is
+    // what the balance was when it was written, kept for the record.)
+    const balRes = await db.query('SELECT balance_type, balance_hours FROM "TimeOffBalances" WHERE username=$1', [targetUsername]);
+    const running = Object.fromEntries(balRes.rows.map(b => [b.balance_type, Number(b.balance_hours)]));
+    const rows = result.rows.map(r => {
+      const hours = Number(r.hours);
+      const balanceAfter = round2(running[r.balance_type] ?? 0);
+      running[r.balance_type] = balanceAfter - hours;
+      return { ...r, hours, balance_after: balanceAfter, recorded_balance_after: Number(r.balance_after), worked_hours: r.worked_hours === null ? null : Number(r.worked_hours) };
+    });
+    return json(200, rows);
   }
 
   // The accrual rules as they apply to someone, for My time's forecast and
