@@ -40,11 +40,20 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/staff/me' && method === 'PUT') {
-    const { phone, email, preferred_name } = body;
+    const { email, preferred_name } = body;
+    // Phone is a US 10-digit number (a leading country code 1 is allowed),
+    // stored as (555) 555-5555 -- never free text.
+    let phone = null;
+    if (body.phone) {
+      let digits = String(body.phone).replace(/\D/g, '');
+      if (digits.length === 11 && digits.startsWith('1')) digits = digits.slice(1);
+      if (digits.length !== 10) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
+      phone = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+    }
     const result = await db.query(
       `UPDATE "Staff" SET phone=$1, email=$2, preferred_name=$3 WHERE username=$4
        RETURNING username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date`,
-      [phone || null, email || null, preferred_name || null, currentUser.username]
+      [phone, email || null, preferred_name || null, currentUser.username]
     );
     return json(200, result.rows[0]);
   }

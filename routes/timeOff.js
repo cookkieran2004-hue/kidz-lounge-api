@@ -467,9 +467,36 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       return json(503, { error: `Meetings with other staff need the database update (${SHARED_MEETINGS_MIGRATION}) to be run first.` });
     }
 
+    // PTO/UPTO: a change isn't linked to the entry it changes. The original
+    // is cancelled on the spot -- its hours refunded, its blocks taken off
+    // the schedule, the request removed -- and the change is filed as an
+    // ordinary new request (pending from an employee, approved from an
+    // admin). Other types keep the linked change flow above.
+    const cancelsOriginal = !!original && BALANCE_TYPES.has(original.request_type);
+    if (cancelsOriginal) delete extra.replaces_request_id;
+    const cancelOriginal = async (client) => {
+      const locked = (await client.query('SELECT * FROM "TimeOffRequests" WHERE id=$1 FOR UPDATE', [original.id])).rows[0];
+      if (!locked || locked.status !== 'approved') throw new TimeOffError(409, 'The entry you are changing has already been changed or removed. Refresh and try again.');
+      await undoApproval(client, locked);
+      await client.query(`DELETE FROM "TimeOffRequests" WHERE replaces_request_id=$1 AND status='pending'`, [String(locked.id)]);
+      await client.query('DELETE FROM "TimeOffRequests" WHERE id=$1', [locked.id]);
+    };
+
     if (!adminAdding) {
-      const row = await insertRequest(db, withCreatedBy, currentUser.username, currentUser.username, fields, extra);
-      return json(201, row);
+      if (!cancelsOriginal) {
+        const row = await insertRequest(db, withCreatedBy, currentUser.username, currentUser.username, fields, extra);
+        return json(201, row);
+      }
+      try {
+        const row = await inTransaction(db, async (client) => {
+          await cancelOriginal(client);
+          return insertRequest(client, withCreatedBy, currentUser.username, currentUser.username, fields, extra);
+        });
+        return json(201, { ...row, cancelled_original: true });
+      } catch (err) {
+        if (err instanceof TimeOffError) return json(err.status, { error: err.message, ...err.extra });
+        throw err;
+      }
     }
 
     if (isBalanceType && !confirm_negative_balance) {
@@ -489,8 +516,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
     try {
       const approved = await inTransaction(db, async (client) => {
+        if (cancelsOriginal) await cancelOriginal(client);
         const row = await insertRequest(client, withCreatedBy, targetUsername, currentUser.username, fields, extra);
-        return approveWithReplacement(client, row, currentUser.username);
+        return cancelsOriginal ? applyApproval(client, row, currentUser.username) : approveWithReplacement(client, row, currentUser.username);
       });
       return json(201, approved);
     } catch (err) {
