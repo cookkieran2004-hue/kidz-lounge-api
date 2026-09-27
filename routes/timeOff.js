@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canManage, canAdminister } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 const { hasAgendaTable, hasCommentsTable, getAgenda, setAgenda, getMeetingComments, setMeetingComments } = require('../lib/meetingAgendas');
 const {
@@ -377,7 +378,7 @@ async function loadMeeting(db, id, currentUser, { write = false } = {}) {
   if (!row) throw new TimeOffError(404, 'Meeting not found.');
   if (row.request_type !== 'Meeting') throw new TimeOffError(400, 'Agendas are only for meetings.');
   if (row.status === 'denied') throw new TimeOffError(409, 'This meeting was denied.');
-  if (write && !isInMeeting(row, currentUser.username) && currentUser.role !== 'admin') {
+  if (write && !isInMeeting(row, currentUser.username) && !canManage(currentUser)) {
     throw new TimeOffError(403, "Only people in this meeting (or an admin) can edit its agenda.");
   }
   if (!(await hasAgendaTable(db))) throw new TimeOffError(503, 'Meeting agendas need the database update (migrations/2026-09-26_ooo_edits_and_meeting_agendas.sql) to be run first.');
@@ -447,19 +448,19 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       original = origRes.rows[0];
       if (!original) return json(404, { error: 'The entry you are changing no longer exists.' });
       if (original.status !== 'approved') return json(409, { error: 'Only approved time off can be changed this way. Pending requests can be deleted and resubmitted.' });
-      if (original.username !== currentUser.username && currentUser.role !== 'admin') {
+      if (original.username !== currentUser.username && !canAdminister(currentUser)) {
         return json(403, { error: 'You can only change your own time off.' });
       }
-      if (currentUser.role !== 'admin') {
+      if (!canAdminister(currentUser)) {
         const pendingRes = await db.query(`SELECT 1 FROM "TimeOffRequests" WHERE replaces_request_id=$1 AND status='pending'`, [String(original.id)]);
         if (pendingRes.rows[0]) return json(409, { error: 'A change to this entry is already waiting for approval. Delete that change first if you want to submit a different one.' });
       }
     }
-    const targetUsername = original ? (currentUser.role === 'admin' ? original.username : null) : requestedUsername;
+    const targetUsername = original ? (canAdminister(currentUser) ? original.username : null) : requestedUsername;
 
     const adminAdding = !!targetUsername;
     if (adminAdding) {
-      if (currentUser.role !== 'admin') return json(403, { error: 'Only an admin can add time off for someone else.' });
+      if (!canAdminister(currentUser)) return json(403, { error: 'Only an admin can add time off for someone else.' });
       const target = await db.query('SELECT username, archived FROM "Staff" WHERE username=$1', [targetUsername]);
       if (!target.rows[0]) return json(404, { error: `No staff account "${targetUsername}".` });
       if (target.rows[0].archived) return json(400, { error: `${targetUsername}'s account is archived. Restore it before adding time off.` });
@@ -594,7 +595,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/time-off/requests' && method === 'GET') {
-    if (currentUser.role === 'admin' && qs.all === 'true') {
+    if (canAdminister(currentUser) && qs.all === 'true') {
       let sql = `SELECT * FROM "TimeOffRequests"`;
       const params = [];
       if (qs.status) { params.push(qs.status); sql += ` WHERE status = $${params.length}`; }
@@ -639,7 +640,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       )).rows[0];
     }
     if (!found) return json(200, { request: null });
-    const isAdmin = currentUser.role === 'admin';
+    const isAdmin = canAdminister(currentUser);
     return json(200, {
       request: {
         id: found.id, username: found.username, request_type: found.request_type, status: found.status,
@@ -726,7 +727,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       } else {
         throw new TimeOffError(400, 'series_id or ooo_id is required.');
       }
-      const canEdit = currentUser.role === 'admin' || (!!currentUser.providerName && currentUser.providerName === provider);
+      const canEdit = canManage(currentUser) || (!!currentUser.providerName && currentUser.providerName === provider);
       if (method === 'PUT') {
         if (!canEdit) throw new TimeOffError(403, "Only this provider or an admin can edit this meeting's agenda.");
         await inTransaction(db, async (client) => {
@@ -786,7 +787,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         } else if (action === 'delete') {
           const target = list.find(c => c.id === commentId);
           if (!target) throw new TimeOffError(404, 'Comment not found.');
-          if (target.author_username !== currentUser.username && currentUser.role !== 'admin') throw new TimeOffError(403, 'You can only delete your own comments.');
+          if (target.author_username !== currentUser.username && !canManage(currentUser)) throw new TimeOffError(403, 'You can only delete your own comments.');
           list = list.filter(c => c.id !== commentId);
         } else {
           throw new TimeOffError(400, 'Unknown comment action.');
@@ -813,7 +814,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/time-off\/requests\/[^/]+\/approve$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/')[3];
 
     const reqRes = await db.query('SELECT * FROM "TimeOffRequests" WHERE id=$1', [id]);
@@ -831,7 +832,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/time-off\/requests\/[^/]+\/deny$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/')[3];
     const { review_note } = body;
 
@@ -847,7 +848,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/time-off\/requests\/[^/]+$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/')[3];
 
     const existingRes = await db.query('SELECT status, username FROM "TimeOffRequests" WHERE id=$1', [id]);
@@ -924,7 +925,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const reqRes = await db.query('SELECT * FROM "TimeOffRequests" WHERE id=$1', [id]);
     const reqRow = reqRes.rows[0];
     if (!reqRow) return json(404, { error: 'Request not found.' });
-    if (reqRow.username !== currentUser.username && currentUser.role !== 'admin') {
+    if (reqRow.username !== currentUser.username && !canAdminister(currentUser)) {
       return json(403, { error: 'You can only delete your own requests.' });
     }
 
@@ -942,7 +943,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/time-off/balances' && method === 'GET') {
-    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const targetUsername = (canAdminister(currentUser) && qs.username) ? qs.username : currentUser.username;
     const result = await db.query('SELECT balance_type, balance_hours FROM "TimeOffBalances" WHERE username=$1', [targetUsername]);
     const byType = Object.fromEntries(result.rows.map(r => [r.balance_type, Number(r.balance_hours)]));
     const balances = [...BALANCE_TYPES].map(t => ({ balance_type: t, balance_hours: byType[t] ?? 0 }));
@@ -950,7 +951,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/time-off/balances' && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { username, balance_type, balance_hours } = body;
     if (!username || !BALANCE_TYPES.has(balance_type) || balance_hours === undefined) {
       return json(400, { error: 'username, balance_type, and balance_hours are required.' });
@@ -977,7 +978,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // What a PTO/UPTO span would cost in scheduled hours, for the request
   // form. Your own; an admin can pass ?username=.
   if (path === '/time-off/estimate' && method === 'GET') {
-    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const targetUsername = (canAdminister(currentUser) && qs.username) ? qs.username : currentUser.username;
     const { start_date, end_date, start_time, end_time } = qs;
     if (!start_date || !end_date || !start_time || !end_time) return json(400, { error: 'start_date, end_date, start_time and end_time are required.' });
     if (end_date < start_date) return json(200, { hours: 0 });
@@ -987,7 +988,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   // Balance history, newest first. Your own; an admin can pass ?username=.
   if (path === '/time-off/ledger' && method === 'GET') {
-    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const targetUsername = (canAdminister(currentUser) && qs.username) ? qs.username : currentUser.username;
     if (!(await hasLedgerTable(db))) return json(200, []);
     const limit = Math.min(Number(qs.limit) || 60, 500);
     const params = [targetUsername];
@@ -1015,7 +1016,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // The accrual rules as they apply to someone, for My time's forecast and
   // the staff profile. Your own; an admin can pass ?username=.
   if (path === '/time-off/policy' && method === 'GET') {
-    const targetUsername = (currentUser.role === 'admin' && qs.username) ? qs.username : currentUser.username;
+    const targetUsername = (canAdminister(currentUser) && qs.username) ? qs.username : currentUser.username;
     const staff = await loadStaff(db, targetUsername);
     if (!staff) return json(404, { error: 'No such staff account.' });
     const today = todayStr();

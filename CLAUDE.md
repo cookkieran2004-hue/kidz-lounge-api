@@ -17,7 +17,12 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
   3. **JWT check** (12h tokens, `JWT_SECRET`). After that, **every request re-reads `role`, `provider_name`, `archived` and `must_reset_password` from `Staff`**, so use `currentUser` and never trust role claims from the token. Users with `must_reset_password` can only reach `/auth/me` and `/auth/set-password`.
   4. Each module in `ROUTE_MODULES` gets `handle(ctx)` in turn. The first non-null response wins. If none answers, the response is a 404.
 - **Route modules** (`routes/*.js`) export `handle({ path, method, qs, body, db, currentUser, event })`. They match paths with `path === '...'` or `path.match(/^\/x\/[^/]+$/)`, return `json(status, body)` from `lib/http.js`, and return `null` when a request isn't theirs. Every route pattern must be unique across all modules. Uncaught errors become a 500 with `err.message`.
-- **Authorization** is checked inline: `if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' })`. Roles are `admin` or everyone else. Sensitive staff-account changes also need `verifyAdminPassword` (the admin re-enters their own password). Endpoints that read "your own" data usually let an admin pass `?username=`.
+- **Authorization** is checked inline with the helpers in `lib/roles.js`, e.g. `if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' })`. Never compare `role` to a string in a route. Roles (`Staff.role`, `migrations/2026-10-07_staff_roles.sql`):
+  - `staff`: their own things only.
+  - `reception`: `canManage` (anyone's schedule, patients, tasks, OOO) but not `canAdminister` (the Admin area: staff accounts, time-off approvals and balances, office hours, providers).
+  - `admin`: both.
+  - `developer`: both, plus support tickets. Never given the system's patient tasks (`getsPatientTasks`) and can't be a case manager (`canCaseManage`; an existing link is kept on edits, and its tasks fall back).
+  - Admins and developers can change anyone's role, their own included, but `PUT /auth/users/:id` refuses a change that leaves no active admin or developer. Sensitive staff-account changes also need `verifyAdminPassword` (the admin re-enters their own password). Endpoints that read "your own" data usually let an admin pass `?username=`.
 - **DB:** use `getPool()` from `lib/db.js`, a shared pool with max 3 connections. For transactions, use `const client = await db.connect(); BEGIN/COMMIT/ROLLBACK; client.release()`, or `inTransaction` in `lib/ptoAccrual.js` / `routes/timeOff.js`. Postgres `date` columns come back as `'YYYY-MM-DD'` strings on purpose (type parser 1082). Keep dates as strings end to end.
 - Env vars: `DB_HOST/PORT/USER/PASSWORD/NAME`, `JWT_SECRET`, `S3_BUCKET_NAME`. Patient documents go to S3 through presigned URLs (`routes/documents.js`).
 
@@ -66,11 +71,11 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - Editing a single occurrence creates a real row with `exception_of_series_id` + `exception_occurrence_date`.
   - Deleting one creates a real row with `deleted = true`, which hides it and blocks regeneration.
   - Exception lookups are batched in one query per call. Don't reintroduce a query per series.
-- **Case manager:** `case_manager_username` is the real link. `Case_Manager` is legacy display text, derived on the server (`resolveCaseManagerFields` in `routes/patients.js`). Automated tasks fall back to **all active admins** when no case manager is linked or the linked account is archived (`resolveCaseManagerAssignees` in `lib/utils.js`).
+- **Case manager:** `case_manager_username` is the real link. `Case_Manager` is legacy display text, derived on the server (`resolveCaseManagerFields` in `routes/patients.js`). Automated tasks fall back to **all active admins and reception** when no case manager is linked, or the linked account is archived or a developer (`resolveCaseManagerAssignees` in `lib/utils.js`).
 - **Compliance tasks** (`lib/complianceCheck.js`): RX expiring within 14 days and IFSP end dates go to the case manager. Report Date goes to the patient's current providers. Credentials expiring within 14 days go to the credential holder. Duplicates are blocked by (patient, deadline_type, deadline_date, assigned_to).
 - **Staff phone** (`PUT /staff/me`) must be a US 10-digit number, stored as `(555) 555-5555`.
 - **Names, not usernames:** anything user-facing that says who did something should use a display name (`displayNameFor` in `lib/utils.js`). `GET /staff/directory?include_archived=true` lets the frontend name people who have left.
-- The support ticket inbox belongs to a single hardcoded user, `SUPPORT_OWNER = 'KJC135'` (`routes/support.js`, and mirrored in the frontend's `src/supportCount.js`).
+- The support ticket inbox is for **Developers only** (`canSeeTickets` in `routes/support.js`, mirrored by `canSeeSupportTickets` in the frontend's `src/supportCount.js`).
 - Partial updates: use `mergedField(body, key, existingRow)`. A missing key keeps the current value, and a key sent as `''` or `null` clears it.
 
 ## Migrations

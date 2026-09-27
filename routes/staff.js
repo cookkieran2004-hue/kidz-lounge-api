@@ -1,4 +1,5 @@
 const bcrypt = require('bcryptjs');
+const { canManage, canAdminister, canCaseManage, ROLES } = require('../lib/roles');
 const { json } = require('../lib/http');
 const { HttpError, syncLinkedProvider, assertProviderNotLinkedElsewhere } = require('../lib/providerNames');
 const { verifyAdminPassword } = require('../lib/auth');
@@ -16,11 +17,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/staff/directory' && method === 'GET') {
     const includeArchived = qs.include_archived === 'true';
     const result = await db.query(
-      `SELECT username, first_name, middle_name, last_name, preferred_name, archived FROM "Staff" WHERE $1 OR archived = false ORDER BY username`,
+      `SELECT username, role, first_name, middle_name, last_name, preferred_name, archived FROM "Staff" WHERE $1 OR archived = false ORDER BY username`,
       [includeArchived]
     );
     const directory = result.rows.map(s => ({
       username: s.username, display_name: displayNameFor(s), ...(includeArchived ? { archived: !!s.archived } : {}),
+      // Developers can't be case managers (lib/roles.js); the pickers hide them.
+      can_case_manage: canCaseManage(s.role),
     }));
     return json(200, directory);
   }
@@ -81,7 +84,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const id = path.split('/').pop();
     const existing = await db.query('SELECT username FROM "StaffCredentials" WHERE id=$1', [id]);
     if (!existing.rows[0]) return json(404, { error: 'Credential not found.' });
-    if (existing.rows[0].username !== currentUser.username && currentUser.role !== 'admin') {
+    if (existing.rows[0].username !== currentUser.username && !canAdminister(currentUser)) {
       return json(403, { error: 'You can only edit your own credentials.' });
     }
     const { credential_name, expiration_date, notes } = body;
@@ -101,7 +104,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const id = path.split('/').pop();
     const existing = await db.query('SELECT username FROM "StaffCredentials" WHERE id=$1', [id]);
     if (!existing.rows[0]) return json(404, { error: 'Credential not found.' });
-    if (existing.rows[0].username !== currentUser.username && currentUser.role !== 'admin') {
+    if (existing.rows[0].username !== currentUser.username && !canAdminister(currentUser)) {
       return json(403, { error: 'You can only delete your own credentials.' });
     }
     await db.query('DELETE FROM "StaffCredentials" WHERE id=$1', [id]);
@@ -109,7 +112,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/auth/users' && method === 'GET') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canManage(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT id, username, role, provider_name, must_reset_password, created_at, last_login,
               first_name, middle_name, last_name, preferred_name, position, archived, hire_date
@@ -119,7 +122,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/auth/users' && method === 'POST') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { first_name, middle_name, last_name, preferred_name, position, temporary_password, role, provider_name, admin_password, hire_date } = body;
     if (!(await verifyAdminPassword(db, currentUser, admin_password))) {
       return json(401, { error: 'Incorrect password. Please re-enter your password to confirm this change.' });
@@ -155,7 +158,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         `INSERT INTO "Staff" (username, password_hash, role, must_reset_password, provider_name, first_name, middle_name, last_name, preferred_name, position, hire_date)
          VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id, username, role, provider_name, must_reset_password, created_at, first_name, middle_name, last_name, preferred_name, position, archived, hire_date`,
-        [username, passwordHash, role === 'admin' ? 'admin' : 'staff', provider_name || null, first_name.trim(), middle_name.trim(), last_name.trim(), preferred_name?.trim() || null, position.trim(), hire_date || null]
+        [username, passwordHash, ROLES.includes(role) ? role : 'staff', provider_name || null, first_name.trim(), middle_name.trim(), last_name.trim(), preferred_name?.trim() || null, position.trim(), hire_date || null]
       );
       const created = result.rows[0];
       const syncedName = await syncLinkedProvider(client, created);
@@ -172,9 +175,12 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/auth\/users\/[^/]+$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/').pop();
     const { role, reset_temporary_password, provider_name, admin_password, first_name, middle_name, last_name, preferred_name, position, archived, hire_date } = body;
+    if (role !== undefined && role !== null && role !== '' && !ROLES.includes(role)) {
+      return json(400, { error: `Role must be one of: ${ROLES.join(', ')}.` });
+    }
     if (!(await verifyAdminPassword(db, currentUser, admin_password))) {
       return json(401, { error: 'Incorrect password. Please re-enter your password to confirm this change.' });
     }
@@ -221,6 +227,16 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     );
     const updated = result.rows[0];
     if (!updated) { await client.query('ROLLBACK'); return json(404, { error: 'Staff account not found.' }); }
+    // Admins and developers may change anyone's role, their own included,
+    // but someone has to be left who can reach the Admin area -- otherwise
+    // nobody could ever change a role back.
+    const leftRes = await client.query(
+      `SELECT COUNT(*)::int AS n FROM "Staff" WHERE role IN ('admin', 'developer') AND archived = false`
+    );
+    if (leftRes.rows[0].n === 0) {
+      await client.query('ROLLBACK');
+      return json(400, { error: 'At least one active Admin or Developer is needed. Give someone else that role first.' });
+    }
     const syncedName = await syncLinkedProvider(client, updated);
     if (syncedName) updated.provider_name = syncedName;
     await client.query('COMMIT');

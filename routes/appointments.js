@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments } = require('../lib/recurring');
 
@@ -21,7 +22,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     let { provider, start, end } = qs;
     // Non-admins can only ever see their own linked provider's schedule,
     // regardless of what they pass in the query string.
-    if (currentUser.role !== 'admin') {
+    if (!canManage(currentUser)) {
       if (!currentUser.providerName) return json(403, { error: 'No provider is linked to your account.' });
       provider = currentUser.providerName;
     }
@@ -139,7 +140,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     } else if (action === 'delete') {
       const target = commentsList.find(c => c.id === commentId);
       if (!target) return json(404, { error: 'Comment not found.' });
-      if (target.author_username !== currentUser.username && currentUser.role !== 'admin') {
+      if (target.author_username !== currentUser.username && !canManage(currentUser)) {
         return json(403, { error: 'You can only delete your own comments.' });
       }
       commentsList = commentsList.filter(c => c.id !== commentId);

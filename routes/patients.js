@@ -1,6 +1,7 @@
 const { json } = require('../lib/http');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
+const { canCaseManage } = require('../lib/roles');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -34,16 +35,24 @@ async function saveAlertFields(q, id, body, existing = {}) {
 // so the two can never drift out of sync. The special "Not Needed" value
 // and a plain empty/unassigned state have no staff link, so whatever text
 // was sent for those passes through untouched.
-async function resolveCaseManagerFields(db, caseManagerUsername, caseManagerText) {
+//
+// Developers can't be made case managers (lib/roles.js canCaseManage), so
+// that returns { error }. `currentUsername` is the patient's existing case
+// manager: saving an edit that leaves an already-linked developer in place
+// is allowed, so editing anything else on that chart isn't blocked.
+async function resolveCaseManagerFields(db, caseManagerUsername, caseManagerText, currentUsername = null) {
   if (!caseManagerUsername) {
     return { case_manager_username: null, Case_Manager: caseManagerText || null };
   }
   const staffRes = await db.query(
-    'SELECT username, first_name, middle_name, last_name, preferred_name FROM "Staff" WHERE username=$1',
+    'SELECT username, role, first_name, middle_name, last_name, preferred_name FROM "Staff" WHERE username=$1',
     [caseManagerUsername]
   );
   const staff = staffRes.rows[0];
   if (!staff) return { case_manager_username: null, Case_Manager: caseManagerText || null };
+  if (!canCaseManage(staff.role) && staff.username !== currentUsername) {
+    return { error: `${displayNameFor(staff)} is a Developer and can't be a case manager. Choose someone else.` };
+  }
   return { case_manager_username: staff.username, Case_Manager: displayNameFor(staff) };
 }
 
@@ -77,6 +86,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     // the patient's permanent, computer-assigned unique identifier.
     const mrn = await generateUniqueMRN(db);
     const caseManagerFields = await resolveCaseManagerFields(db, case_manager_username, Case_Manager);
+    if (caseManagerFields.error) return json(400, { error: caseManagerFields.error });
     const result = await db.query(
       `INSERT INTO "Patients"
         (mrn, "Name", "Program", "Parent_Name", "Relationship_To_Patient", "Parent_Phone", "Parent_Email",
@@ -155,8 +165,12 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       // derived from it), so touching one without the other would let them
       // drift out of sync.
       const caseManagerFields = Object.prototype.hasOwnProperty.call(body, 'case_manager_username')
-        ? await resolveCaseManagerFields(db, body.case_manager_username, body.Case_Manager)
+        ? await resolveCaseManagerFields(client, body.case_manager_username, body.Case_Manager, existing.case_manager_username)
         : { case_manager_username: existing.case_manager_username, Case_Manager: existing.Case_Manager };
+      if (caseManagerFields.error) {
+        await client.query('ROLLBACK');
+        return json(400, { error: caseManagerFields.error });
+      }
 
       const updateRes = await client.query(
         `UPDATE "Patients" SET

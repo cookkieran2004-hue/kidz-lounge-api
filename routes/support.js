@@ -6,9 +6,10 @@ const { json } = require('../lib/http');
 // POST /support/tickets is the one route besides login that works WITHOUT
 // signing in (index.js lets it through), so someone who can't sign in can
 // still report it. When a valid sign-in is present, the ticket records who
-// sent it. Every ticket goes to SUPPORT_OWNER's Support tickets inbox (the
-// menu item with the green count) -- not to their tasks.
-const SUPPORT_OWNER = 'KJC135';
+// sent it. Every ticket goes to the Support tickets inbox (the menu item
+// with the green count), which only Developers can see -- not to anyone's
+// tasks. Same rule as the frontend's supportCount.js.
+const canSeeTickets = (user) => user?.role === 'developer';
 const URGENCIES = ['Low', 'Medium', 'High', 'Urgent'];
 const LIMITS = { issue: 5000, contact_name: 120, contact_info: 300, page: 300 };
 
@@ -138,7 +139,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/support/tickets/open-count' && method === 'GET') {
-    if (currentUser.username !== SUPPORT_OWNER || !(await hasTable(db))) return json(200, { open: 0 });
+    if (!canSeeTickets(currentUser) || !(await hasTable(db))) return json(200, { open: 0 });
     const res = await db.query(`SELECT COUNT(*)::int AS open FROM "SupportTickets" WHERE status = 'open'`);
     return json(200, { open: res.rows[0].open });
   }
@@ -146,7 +147,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   const listRoute = path === '/support/tickets';
   const idRoute = path.match(/^\/support\/tickets\/([^/]+)$/);
   if (!listRoute && !idRoute) return null;
-  if (currentUser.username !== SUPPORT_OWNER) return json(403, { error: 'Only the support desk can see tickets.' });
+  if (!canSeeTickets(currentUser)) return json(403, { error: 'Only Developers can see support tickets.' });
   if (!(await hasTable(db))) return listRoute && method === 'GET' ? json(200, []) : json(503, { error: 'Run migrations/2026-09-30_support_tickets.sql first.' });
 
   if (listRoute && method === 'GET') {
@@ -181,4 +182,4 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   return null;
 }
 
-module.exports = { handle, submitTicket, SUPPORT_OWNER, newTicketReference };
+module.exports = { handle, submitTicket, newTicketReference };

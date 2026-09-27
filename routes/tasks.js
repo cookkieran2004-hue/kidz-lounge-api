@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canManage } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 
 async function handle({ path, method, qs, body, db, currentUser }) {
@@ -6,7 +7,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     // Everyone can see their own tasks. An admin can look up someone
     // else's specifically via ?assigned_to=username.
     let assignedTo = currentUser.username;
-    if (qs.assigned_to && currentUser.role === 'admin') {
+    if (qs.assigned_to && canManage(currentUser)) {
       assignedTo = qs.assigned_to;
     }
     const result = await db.query(
@@ -22,7 +23,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/tasks/board' && method === 'GET') {
     // The admin to-do board: every task, across every staff member, so an
     // admin can see who has what and what's been completed.
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canManage(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT t.*,
               at.first_name AS assigned_to_first_name, at.last_name AS assigned_to_last_name, at.preferred_name AS assigned_to_preferred_name,
@@ -45,7 +46,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!assigned_to || !assigned_to.trim()) return json(400, { error: 'A task must be assigned to someone.' });
     // Anyone can create a task for themselves; only an admin can assign a
     // task to someone else.
-    if (assigned_to.trim() !== currentUser.username && currentUser.role !== 'admin') {
+    if (assigned_to.trim() !== currentUser.username && !canManage(currentUser)) {
       return json(403, { error: 'Only an admin can assign a task to someone else.' });
     }
     const result = await db.query(
@@ -65,7 +66,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const { title, description, due_date, status, assigned_to } = body;
     const isAssignee = existingTask.assigned_to === currentUser.username;
     const isAssigner = existingTask.assigned_by === currentUser.username;
-    const isAdmin = currentUser.role === 'admin';
+    const isAdmin = canManage(currentUser);
 
     // Marking a task done/reopening it is just tracking progress, so the
     // assignee, the assigner, or an admin can all do that. Actually editing
@@ -113,7 +114,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
     const isAssignee = existingTask.assigned_to === currentUser.username;
     const isAssigner = existingTask.assigned_by === currentUser.username;
-    const isAdmin = currentUser.role === 'admin';
+    const isAdmin = canManage(currentUser);
     if (!isAssignee && !isAssigner && !isAdmin) {
       return json(403, { error: 'You do not have access to this task.' });
     }
@@ -177,7 +178,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const existingTask = existingRes.rows[0];
     if (!existingTask) return json(404, { error: 'Task not found.' });
 
-    const canDelete = currentUser.role === 'admin' || existingTask.assigned_by === currentUser.username;
+    const canDelete = canManage(currentUser) || existingTask.assigned_by === currentUser.username;
     if (!canDelete) return json(403, { error: 'Only an admin or the person who assigned this task can remove it.' });
 
     await db.query('DELETE FROM "Tasks" WHERE id=$1', [id]);

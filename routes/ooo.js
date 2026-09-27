@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canManage: hasManageRole } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 const { getMergedOOO } = require('../lib/recurring');
 
@@ -11,7 +12,7 @@ const { getMergedOOO } = require('../lib/recurring');
 // call to these endpoints -- otherwise approval would be trivially
 // bypassable.
 function canManage(currentUser, providerName) {
-  return currentUser.role === 'admin' || (!!currentUser.providerName && currentUser.providerName === providerName);
+  return hasManageRole(currentUser) || (!!currentUser.providerName && currentUser.providerName === providerName);
 }
 
 async function handle({ path, method, qs, body, db, currentUser }) {
@@ -24,7 +25,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path === '/ooo/range' && method === 'GET') {
     let { provider, start, end } = qs;
-    if (currentUser.role !== 'admin') {
+    if (!hasManageRole(currentUser)) {
       if (!currentUser.providerName) return json(403, { error: 'No provider is linked to your account.' });
       provider = currentUser.providerName;
     }
@@ -40,7 +41,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/ooo' && method === 'POST') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
+    if (!hasManageRole(currentUser)) return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
     const { provider, ooo_date, start_time, end_time, type, fin } = body;
     const result = await db.query(
       `INSERT INTO "Out_of_Office" (provider, ooo_date, start_time, end_time, type, fin)
@@ -106,7 +107,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     } else if (action === 'delete') {
       const target = commentsList.find(c => c.id === commentId);
       if (!target) return json(404, { error: 'Comment not found.' });
-      if (target.author_username !== currentUser.username && currentUser.role !== 'admin') {
+      if (target.author_username !== currentUser.username && !hasManageRole(currentUser)) {
         return json(403, { error: 'You can only delete your own comments.' });
       }
       commentsList = commentsList.filter(c => c.id !== commentId);
@@ -163,7 +164,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/ooo-series' && method === 'POST') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
+    if (!hasManageRole(currentUser)) return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
     const { provider, weekday, start_time, end_time, type, start_date } = body;
     if (provider == null || weekday == null || !start_time || !end_time || !type || !start_date) {
       return json(400, { error: 'provider, weekday, start_time, end_time, type, and start_date are required.' });

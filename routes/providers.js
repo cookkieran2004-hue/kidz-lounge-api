@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canAdminister } = require('../lib/roles');
 const { HttpError, assertNameAvailable, cascadeProviderRename } = require('../lib/providerNames');
 
 async function handle({ path, method, qs, body, db, currentUser }) {
@@ -26,7 +27,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path === '/providers' && method === 'POST') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { first_name, last_name, specialty, credentials } = body;
     if (!first_name?.trim() || !last_name?.trim()) {
       return json(400, { error: 'First name and last name are required.' });
@@ -46,7 +47,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/providers\/[^/]+$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/').pop();
     const { first_name, last_name, specialty, credentials } = body;
 
@@ -101,7 +102,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/providers\/[^/]+$/) && method === 'DELETE') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/').pop();
     const force = qs.force === 'true';
     const providerRes = await db.query('SELECT "Name" FROM "Providers" WHERE id=$1', [id]);

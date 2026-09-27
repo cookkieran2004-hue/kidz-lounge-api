@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const { canAdminister } = require('../lib/roles');
 const { hasChangesTable, loadChangesByProvider, scheduleForDate } = require('../lib/scheduleChanges');
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -97,7 +98,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // which is a single source of truth rather than needing to keep N
   // duplicated rows (one per provider) in sync with it.
   if (path === '/office-hours' && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { weekday, open_time, close_time, closed } = body;
     if (weekday === undefined || weekday === null || weekday < 0 || weekday > 6) {
       return json(400, { error: 'weekday (0-6) is required.' });
@@ -126,7 +127,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // The schedule views pick it up via /office-hours/closed-dates, no
   // per-provider rows needed.
   if (path === '/office-closures' && method === 'POST') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { closure_date, reason } = body;
     if (!closure_date) return json(400, { error: 'closure_date is required.' });
     const closureRes = await db.query(
@@ -137,7 +138,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
 
   if (path.match(/^\/office-closures\/[^/]+$/) && method === 'DELETE') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/').pop();
     const result = await db.query('DELETE FROM "OfficeClosures" WHERE id=$1 RETURNING id', [id]);
     if (!result.rows[0]) return json(404, { error: 'Closure not found.' });
@@ -164,7 +165,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // GET /providers/:name/contracted-gaps below), so there's nothing that
   // can go stale.
   if (path.match(/^\/providers\/[^/]+\/usual-schedule$/) && method === 'PUT') {
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const providerName = decodeURIComponent(path.split('/')[2]);
     const { schedule } = body;
     if (!Array.isArray(schedule)) return json(400, { error: 'schedule must be an array.' });
@@ -203,7 +204,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       return changes.map(c => ({ ...c, schedule: days.filter(d => String(d.change_id) === String(c.id)).map(({ weekday, start_time, end_time }) => ({ weekday: Number(weekday), start_time, end_time })) }));
     };
     if (changesRoute && method === 'GET') return json(200, await listFor(decodeURIComponent(changesRoute[1])));
-    if (currentUser.role !== 'admin') return json(403, { error: 'Admin access required.' });
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
 
     const validate = () => {
       const { start_date, end_date, schedule } = body;
