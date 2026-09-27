@@ -179,6 +179,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
     return json(200, res.rows[0]);
   }
+  // Permanently, e.g. spam or a test ticket. Resolving keeps the record;
+  // this doesn't (the sender's resolved popup goes with it).
+  if (idRoute && method === 'DELETE') {
+    const res = await db.query('DELETE FROM "SupportTickets" WHERE id::text = $1 RETURNING id', [idRoute[1]]);
+    if (!res.rows[0]) return json(404, { error: 'Ticket not found.' });
+    return json(200, { deleted: true });
+  }
   return null;
 }
 
