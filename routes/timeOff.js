@@ -950,6 +950,48 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, balances);
   }
 
+  // Everyone's PTO / UPTO at a glance, for the Admin time off "Balances"
+  // tab: balance, hours waiting on approval, and this week's scheduled hours
+  // with the PTO they earn. Active staff only.
+  if (path === '/time-off/balances/all' && method === 'GET') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    const staffRes = await db.query(
+      `SELECT username, provider_name, hire_date, archived, first_name, middle_name, last_name, preferred_name
+       FROM "Staff" WHERE archived = false`
+    );
+    const balRes = await db.query(`SELECT username, balance_type, balance_hours FROM "TimeOffBalances" WHERE balance_type IN ('PTO', 'UPTO')`);
+    const pendingRes = await db.query(
+      `SELECT * FROM "TimeOffRequests" WHERE status = 'pending' AND request_type IN ('PTO', 'UPTO')`
+    );
+    const bal = {};
+    for (const b of balRes.rows) (bal[b.username] ||= {})[b.balance_type] = Number(b.balance_hours);
+    const pending = {};
+    for (const r of pendingRes.rows) {
+      const p = (pending[r.username] ||= { PTO: 0, UPTO: 0 });
+      p[r.request_type] = round2(p[r.request_type] + hoursTaken(r));
+    }
+    const today = todayStr();
+    const monday = mondayOf(today);
+    const rows = [];
+    for (const staff of staffRes.rows) {
+      const schedule = await loadSchedule(db, staff, monday, addDays(monday, 6));
+      const weekly = weeklyScheduledHours(schedule, today);
+      rows.push({
+        username: staff.username,
+        display_name: displayNameFor(staff),
+        provider_name: staff.provider_name || null,
+        pto: bal[staff.username]?.PTO ?? 0,
+        upto: bal[staff.username]?.UPTO ?? 0,
+        pending_pto: pending[staff.username]?.PTO ?? 0,
+        pending_upto: pending[staff.username]?.UPTO ?? 0,
+        weekly_scheduled_hours: weekly,
+        weekly_pto_credit: round2(weekly * PTO_RATE),
+      });
+    }
+    rows.sort((x, y) => x.display_name.localeCompare(y.display_name));
+    return json(200, { rows, balance_cap: PTO_BALANCE_CAP });
+  }
+
   if (path === '/time-off/balances' && method === 'PUT') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { username, balance_type, balance_hours } = body;
