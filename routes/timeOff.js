@@ -6,7 +6,7 @@ const {
   PTO_RATE, PTO_BALANCE_CAP, PTO_CARRYOVER_MAX, POLICY_START,
   chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, mondayOf, addDays, round2,
 } = require('../lib/workSchedule');
-const { adjustBalance, removeUsage, hasLedgerTable } = require('../lib/ptoAccrual');
+const { adjustBalance, removeUsage, hasLedgerTable, editWeekHours } = require('../lib/ptoAccrual');
 const { UPTO_MONTHLY_HOURS } = require('../lib/timeOffAccrual');
 
 const BALANCE_TYPES = new Set(['PTO', 'UPTO']);
@@ -1011,6 +1011,24 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       return { ...r, hours, balance_after: balanceAfter, recorded_balance_after: Number(r.balance_after), worked_hours: r.worked_hours === null ? null : Number(r.worked_hours) };
     });
     return json(200, rows);
+  }
+
+  // An admin correcting a week's hours worked (lib/ptoAccrual.js
+  // editWeekHours). Anyone's week, their own included.
+  const weekHoursRoute = path.match(/^\/time-off\/ledger\/([^/]+)\/hours$/);
+  if (weekHoursRoute && method === 'PUT') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    if (!body.username) return json(400, { error: 'Whose week? username is required.' });
+    if (!(await hasLedgerTable(db))) return json(503, { error: 'Run migrations/2026-10-04_weekly_pto_accrual.sql first.' });
+    try {
+      const result = await inTransaction(db, (client) => editWeekHours(client, {
+        entryId: weekHoursRoute[1], username: body.username, days: body.days, reason: body.reason, editedBy: currentUser.username,
+      }));
+      return json(200, result);
+    } catch (err) {
+      if (err.status) return json(err.status, { error: err.message });
+      throw err;
+    }
   }
 
   // The accrual rules as they apply to someone, for My time's forecast and

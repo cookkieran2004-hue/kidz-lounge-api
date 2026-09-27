@@ -58,6 +58,7 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - **Deleting an approved request** removes its `used` entry instead of adding a refund (`removeUsage`). A refund is only written for old requests that have no entry.
   - `GET /time-off/ledger` works each row's displayed balance back from the current balance, so the history always adds up.
   - Only PTO/UPTO are ledgered. Pre-redesign request types (Vacation/Sick/Personal, still `is_balance_type`) adjust their retired balances without ledger entries.
+- **Admins can correct a week's hours worked** (`PUT /time-off/ledger/:id/hours`, `editWeekHours` in `lib/ptoAccrual.js`, from the day-by-day table in Balance history). The credit is re-worked at 0.08/h (an increase still stops at the 120h cap), the difference goes onto today's balance, and the accrual entry is changed in place with `details.edited` (who, when, reason) and each changed day's original `estimated` hours. `recalculate_pto_weeks.js` skips edited weeks.
 - **Endpoints:** `GET /time-off/policy` (rates plus the person's weekly scheduled hours), `/time-off/ledger`, and `/time-off/estimate` (the cost of a span, for the request form).
 - The one-time Sep 1 2026 reset (`../kidz-lounge-scripts/reset_time_off_2026_09_01.js`) has been applied. `recalculate_pto_weeks.js` re-credits past weeks after a rule change.
 
