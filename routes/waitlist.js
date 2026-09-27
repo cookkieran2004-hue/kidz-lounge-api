@@ -5,14 +5,16 @@ const { todayStr } = require('../lib/workSchedule');
 // a service, one entry per patient per specialty. Every signed-in staff
 // member can see and change it -- by design, not an oversight.
 //
-//   GET    /waitlist?view=active|history   active = waiting/contacted, oldest
+//   GET    /waitlist?view=active|history   (&patient=<name> for one patient's)
+//                                          active = waiting/contacted, oldest
 //                                          referral first; history = scheduled/
 //                                          removed, most recently closed first
 //   POST   /waitlist                       { patient_id, specialties: [...],
 //                                            providers: { ST: 'Name' }, ... }
 //                                          one entry per specialty, together
 //   PUT    /waitlist/:id                   partial update; status changes stamp
-//                                          contacted_at / closed_at + closed_by
+//                                          contacted_at / closed_at + closed_by;
+//                                          Scheduled also sets the patient On Program
 //   DELETE /waitlist/:id                   permanently, for entries added by mistake
 //
 // Providers are stored by name like everywhere else, so a rename cascades
@@ -81,10 +83,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (listRoute && method === 'GET') {
     const history = qs.view === 'history';
+    // ?patient=<name>: one patient's active entries -- how the appointment
+    // form checks, after booking, whether to offer taking them off the list.
+    const byPatient = !history && qs.patient ? qs.patient : null;
     const res = await db.query(
       history
         ? `${SELECT} WHERE w.status IN ('scheduled', 'removed') ORDER BY w.closed_at DESC NULLS LAST, w.id DESC LIMIT 300`
-        : `${SELECT} WHERE w.status IN ('waiting', 'contacted') ORDER BY w.referral_date, w.id`
+        : `${SELECT} WHERE w.status IN ('waiting', 'contacted') ${byPatient ? 'AND p."Name" = $1' : ''} ORDER BY w.referral_date, w.id`,
+      byPatient ? [byPatient] : []
     );
     return json(200, { entries: res.rows });
   }
@@ -174,12 +180,33 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const keys = Object.keys(fields);
     if (!keys.length) return json(400, { error: 'Nothing to change.' });
     const sets = keys.map((k, i) => `"${k}"=$${i + 1}`);
-    await db.query(
-      `UPDATE "Waitlist" SET ${sets.join(', ')}, updated_at=now() WHERE id=$${keys.length + 1}`,
-      [...keys.map(k => fields[k]), existing.id]
-    );
+    // Scheduled off the waitlist means they're starting services: the
+    // patient's own status becomes On Program, whichever screen did it.
+    const nowScheduled = fields.status === 'scheduled';
+    let patientNowOnProgram = false;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE "Waitlist" SET ${sets.join(', ')}, updated_at=now() WHERE id=$${keys.length + 1}`,
+        [...keys.map(k => fields[k]), existing.id]
+      );
+      if (nowScheduled) {
+        const changed = await client.query(
+          `UPDATE "Patients" SET "Status"='On Program' WHERE id=$1 AND "Status" IS DISTINCT FROM 'On Program' RETURNING id`,
+          [existing.patient_id]
+        );
+        patientNowOnProgram = !!changed.rows[0];
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
     const updated = await db.query(`${SELECT} WHERE w.id=$1`, [existing.id]);
-    return json(200, updated.rows[0]);
+    return json(200, { ...updated.rows[0], patient_now_on_program: patientNowOnProgram });
   }
 
   if (idMatch && method === 'DELETE') {
