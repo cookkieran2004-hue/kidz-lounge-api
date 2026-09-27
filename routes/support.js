@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { json } = require('../lib/http');
 
 // Help desk / support tickets (migrations/2026-09-30_support_tickets.sql).
@@ -36,6 +37,28 @@ function hasNoticeColumn(db) {
   return noticeColumnPromise;
 }
 
+// Random, letters-only ticket references, e.g. "KL-QMZRTA"
+// (migrations/2026-10-06_support_ticket_reference.sql). No I or O, so a
+// code read over the phone can't be mistaken for 1 or 0. 24^6 is about
+// 190 million codes; a clash is retried.
+const REFERENCE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+function newTicketReference() {
+  let code = '';
+  for (let i = 0; i < 6; i++) code += REFERENCE_ALPHABET[crypto.randomInt(REFERENCE_ALPHABET.length)];
+  return `KL-${code}`;
+}
+// Only a "yes" is remembered, so tickets get references as soon as the
+// migration has run.
+let referenceColumnExists = false;
+async function hasReferenceColumn(db) {
+  if (referenceColumnExists) return true;
+  const r = await db.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = 'SupportTickets' AND column_name = 'reference'`
+  ).catch(() => ({ rows: [] }));
+  referenceColumnExists = r.rows.length > 0;
+  return referenceColumnExists;
+}
+
 let tablePromise = null;
 function hasTable(db) {
   if (!tablePromise) {
@@ -61,12 +84,27 @@ async function submitTicket({ db, body, currentUser, ip }) {
   if (!contactName) return json(400, { error: 'Please enter your name.' });
   if (!contactInfo) return json(400, { error: 'Please enter an email or phone number so we can reach you.' });
 
-  const t = await db.query(
-    `INSERT INTO "SupportTickets" (submitted_by, contact_name, contact_info, urgency, issue, page)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    [currentUser?.username || null, contactName, contactInfo, urgency, issue, page]
-  );
-  return json(201, { id: t.rows[0].id });
+  const values = [currentUser?.username || null, contactName, contactInfo, urgency, issue, page];
+  if (!(await hasReferenceColumn(db))) {
+    const t = await db.query(
+      `INSERT INTO "SupportTickets" (submitted_by, contact_name, contact_info, urgency, issue, page)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      values
+    );
+    return json(201, { id: t.rows[0].id, reference: null });
+  }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const t = await db.query(
+        `INSERT INTO "SupportTickets" (submitted_by, contact_name, contact_info, urgency, issue, page, reference)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, reference`,
+        [...values, newTicketReference()]
+      );
+      return json(201, { id: t.rows[0].id, reference: t.rows[0].reference });
+    } catch (err) {
+      if (err.code !== '23505' || attempt >= 4) throw err; // 23505: that code is taken -- try another
+    }
+  }
 }
 
 // Signed-in routes.
@@ -81,7 +119,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/support/my-notices' && method === 'GET') {
     if (!(await hasTable(db)) || !(await hasNoticeColumn(db))) return json(200, []);
     const res = await db.query(
-      `SELECT id, issue, urgency, created_at, resolved_at, resolution_note FROM "SupportTickets"
+      `SELECT * FROM "SupportTickets"
        WHERE submitted_by = $1 AND status = 'resolved' AND notice_seen_at IS NULL
          AND resolved_by IS DISTINCT FROM $1
        ORDER BY resolved_at`,
@@ -143,4 +181,4 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   return null;
 }
 
-module.exports = { handle, submitTicket, SUPPORT_OWNER };
+module.exports = { handle, submitTicket, SUPPORT_OWNER, newTicketReference };
