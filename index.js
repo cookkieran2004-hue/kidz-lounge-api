@@ -59,7 +59,7 @@ function scheduledJobFor(event) {
 }
 exports.scheduledJobFor = scheduledJobFor;
 
-exports.handler = async (event) => {
+async function handleRequest(event) {
   // EventBridge scheduled trigger for the 72-hour chat cleanup job -- not an
   // HTTP request at all, so it's handled completely separately, before any
   // of the API Gateway-shaped routing below even looks at the event.
@@ -216,7 +216,35 @@ exports.handler = async (event) => {
 
     return json(404, { error: 'Not found', path, method });
   } catch (err) {
-    console.error(err);
-    return json(500, { error: err.message });
+    // The full error stays in CloudWatch, tagged with the request id; the
+    // browser gets a plain message and that id, never database or code
+    // details (HIPAA: don't leak internals).
+    const reference = event.requestContext?.requestId || null;
+    console.error(`Unhandled error (request ${reference}):`, err);
+    return json(500, {
+      error: 'Something went wrong on our side. Please try again, and contact support if it keeps happening.',
+      ...(reference ? { reference } : {}),
+    });
   }
+}
+
+// Which websites may call the API from a browser (CORS). ALLOWED_ORIGINS on
+// the Lambda is a comma-separated list, e.g.
+//   https://kidzlounge.example.com,https://kidz-lounge.vercel.app
+// A request from one of them is answered with that origin; anything else
+// gets the first one, so the browser refuses it. Not set = '*' (as before),
+// so nothing breaks until it's configured.
+function allowedOriginFor(event) {
+  const list = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim().replace(/\/$/, '')).filter(Boolean);
+  if (!list.length) return '*';
+  const origin = event.headers?.origin || event.headers?.Origin || '';
+  return list.includes(origin) ? origin : list[0];
+}
+
+exports.handler = async (event) => {
+  const response = await handleRequest(event);
+  if (!response || typeof response !== 'object') return response;
+  const origin = allowedOriginFor(event);
+  response.headers = { ...(response.headers || {}), 'Access-Control-Allow-Origin': origin, ...(origin === '*' ? {} : { Vary: 'Origin' }) };
+  return response;
 };

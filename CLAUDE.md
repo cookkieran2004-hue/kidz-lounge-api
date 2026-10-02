@@ -34,6 +34,12 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
 - The table is append-only (a trigger rejects UPDATE/DELETE/TRUNCATE) and kept forever.
 - Viewer: `GET /audit-log` (filters, `before` paging, `format=csv`), Developers only (`canViewAuditLog`).
 
+**Security hardening (Oct 2026):**
+- **DB TLS is verified** against `lib/certs/rds-us-east-2-bundle.pem` (`lib/db.js`). Setting `DB_SSL_VERIFY=false` on the Lambda falls back to unverified without a redeploy.
+- **Sign-in lockout** (`lockedOut` in `lib/auth.js`): 5 failed sign-ins for a username, or 20 from one IP, within 15 minutes returns 429 for 15 minutes. It's counted from the audit log's `login_failed` rows ('locked' refusals don't count, and a successful sign-in resets the username count), so there's no lockout before the audit migration.
+- **CORS:** `ALLOWED_ORIGINS` (a comma-separated list on the Lambda) sets `Access-Control-Allow-Origin` per request in the `exports.handler` wrapper. Unset means `*`.
+- **Unhandled errors** return a generic message plus `reference` (the request id). The real error is in CloudWatch under that id. **Never send `err.message` to the browser for unexpected errors.**
+
 **Testing safety:** `index.js` captures `getPool` when it's loaded. Replace `require('./lib/db').getPool` *before* requiring `index.js`, and run test commands with `env -u DB_HOST -u DB_PORT -u DB_USER -u DB_PASSWORD -u DB_NAME`. Kieran's shell often has the real credentials exported, and a test once reached the real database this way.
 
 ## Scheduled jobs
