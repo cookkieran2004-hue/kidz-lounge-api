@@ -2,6 +2,7 @@ const { json } = require('../lib/http');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
 const { canCaseManage } = require('../lib/roles');
+const { todayStr } = require('../lib/workSchedule');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -59,7 +60,29 @@ async function resolveCaseManagerFields(db, caseManagerUsername, caseManagerText
 async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/patients' && method === 'GET') {
     const result = await db.query('SELECT * FROM "Patients" ORDER BY "Name"');
-    return json(200, result.rows);
+    // Each patient's care team: providers with an upcoming, non-canceled
+    // appointment -- the chart's Care Team "Current Providers" -- so the
+    // patient list and data table can show and filter by it. Weekly series
+    // count while they're still running (they aren't stored as single rows).
+    const today = todayStr();
+    const [single, series] = await Promise.all([
+      db.query(
+        `SELECT DISTINCT patient_name, provider FROM "Appointments"
+         WHERE appointment_date >= $1 AND deleted = false AND appointment_status IS DISTINCT FROM 'Canceled' AND provider IS NOT NULL`,
+        [today]
+      ),
+      db.query(
+        `SELECT DISTINCT patient_name, provider FROM "RecurringSeries"
+         WHERE (end_date IS NULL OR end_date >= $1) AND appointment_status IS DISTINCT FROM 'Canceled' AND provider IS NOT NULL`,
+        [today]
+      ),
+    ]);
+    const team = new Map();
+    for (const r of [...single.rows, ...series.rows]) {
+      if (!team.has(r.patient_name)) team.set(r.patient_name, new Set());
+      team.get(r.patient_name).add(r.provider);
+    }
+    return json(200, result.rows.map(p => ({ ...p, care_team: [...(team.get(p.Name) || [])].sort() })));
   }
 
   // Patients with an allergy or immunization note -- small, so the schedule
