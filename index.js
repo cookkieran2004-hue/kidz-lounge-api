@@ -33,6 +33,8 @@ const timeOffRoutes = require('./routes/timeOff');
 const officeHoursRoutes = require('./routes/officeHours');
 const supportRoutes = require('./routes/support');
 const waitlistRoutes = require('./routes/waitlist');
+const auditLogRoutes = require('./routes/auditLog');
+const audit = require('./lib/audit');
 
 // Tried in this order for every authenticated request; the first module to
 // return a non-null response wins. Order between modules doesn't matter for
@@ -40,7 +42,7 @@ const waitlistRoutes = require('./routes/waitlist');
 // but grouping stays roughly domain-by-domain for readability.
 const ROUTE_MODULES = [
   staffRoutes, providerRoutes, patientRoutes, appointmentRoutes,
-  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes,
+  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes,
 ];
 
 // Which scheduled job an EventBridge event is for: its `job` (a rule with a
@@ -114,7 +116,7 @@ exports.handler = async (event) => {
   try {
     // ---------- Auth: login is the only public route ----------
     if (path === '/auth/login' && method === 'POST') {
-      return await handleLogin(db, body);
+      return await handleLogin(db, body, audit.requestMeta(event));
     }
 
     // ---------- Every other route requires a valid staff token ----------
@@ -180,14 +182,37 @@ exports.handler = async (event) => {
     }
 
     if (path === '/auth/set-password' && method === 'POST') {
-      return await handleSetPassword(db, currentUser, body);
+      const result = await handleSetPassword(db, currentUser, body);
+      if (result.statusCode < 300) {
+        await audit.record(db, { username: currentUser.username, role: currentUser.role, action: 'password_set', resource: 'session', method, path, status: result.statusCode, ...audit.requestMeta(event) });
+      }
+      return result;
+    }
+
+    // Signing out (the app calls this before forgetting its token) -- only
+    // so the audit log shows when a session ended.
+    if (path === '/auth/logout' && method === 'POST') {
+      await audit.record(db, { username: currentUser.username, role: currentUser.role, action: 'logout', resource: 'session', method, path, status: 200, ...audit.requestMeta(event), details: body?.reason ? { reason: String(body.reason).slice(0, 40) } : undefined });
+      return json(200, { ok: true });
     }
 
     const ctx = { path, method, qs, body, db, currentUser, event };
-    for (const routeModule of ROUTE_MODULES) {
-      const result = await routeModule.handle(ctx);
-      if (result) return result;
+    // HIPAA audit log: anything touching patient information is recorded
+    // with its outcome (lib/audit.js). Worked out before the route runs so
+    // a delete can still be traced to its patient.
+    const finishAudit = await audit.begin(db, ctx).catch(() => null);
+    let result = null;
+    try {
+      for (const routeModule of ROUTE_MODULES) {
+        result = await routeModule.handle(ctx);
+        if (result) break;
+      }
+    } catch (err) {
+      if (finishAudit) await finishAudit({ statusCode: 500 });
+      throw err;
     }
+    if (finishAudit) await finishAudit(result || { statusCode: 404 });
+    if (result) return result;
 
     return json(404, { error: 'Not found', path, method });
   } catch (err) {

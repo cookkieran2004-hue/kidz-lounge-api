@@ -26,6 +26,17 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
 - **DB:** use `getPool()` from `lib/db.js`, a shared pool with max 3 connections. For transactions, use `const client = await db.connect(); BEGIN/COMMIT/ROLLBACK; client.release()`, or `inTransaction` in `lib/ptoAccrual.js` / `routes/timeOff.js`. Postgres `date` columns come back as `'YYYY-MM-DD'` strings on purpose (type parser 1082). Keep dates as strings end to end.
 - Env vars: `DB_HOST/PORT/USER/PASSWORD/NAME`, `JWT_SECRET`, `S3_BUCKET_NAME`. Patient documents go to S3 through presigned URLs (`routes/documents.js`).
 
+## HIPAA audit log
+
+`lib/audit.js` + `migrations/2026-10-09_audit_log.sql`. `index.js` passes every signed-in request through `audit.begin()`: `describe()` decides whether it touches patient information (patients, documents, clinical documents, appointments, repeating appointments, waitlist) and records who, what, which patient, the HTTP status (refusals included), IP address and user agent. Sign-ins, failed sign-ins (with the reason), sign-outs (`POST /auth/logout`) and password changes are logged from `lib/auth.js` / `index.js`.
+- **When you add a route that reads or changes patient data, add it to `describe()`.**
+- Never log the data itself: updates store field *names*, never values or passwords.
+- Repeat views of the same thing by the same person are skipped for 10 minutes (background polling).
+- The table is append-only (a trigger rejects UPDATE/DELETE/TRUNCATE) and kept forever.
+- Viewer: `GET /audit-log` (filters, `before` paging, `format=csv`), Developers only (`canViewAuditLog`); viewing and exporting are logged too.
+
+**Testing safety:** `index.js` captures `getPool` when it's loaded. Replace `require('./lib/db').getPool` *before* requiring `index.js`, and run test commands with `env -u DB_HOST -u DB_PORT -u DB_USER -u DB_PASSWORD -u DB_NAME`. Kieran's shell often has the real credentials exported, and a test once reached the real database this way.
+
 ## Scheduled jobs
 
 Set up as EventBridge rules on the Lambda (us-east-2). A rule's **name** picks the job.
