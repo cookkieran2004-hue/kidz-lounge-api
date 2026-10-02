@@ -2,6 +2,7 @@ const { json } = require('../lib/http');
 const { canManage: hasManageRole } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 const { getMergedOOO } = require('../lib/recurring');
+const { markWeekAgendas } = require('../lib/meetingAgendas');
 
 // Direct OOO mutation is now scoped to an admin, or the staff member whose
 // own linked provider the entry belongs to -- anyone else has no business
@@ -20,7 +21,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const { start, end } = qs;
     if (!start || !end) return json(400, { error: 'start and end are required.' });
     const merged = await getMergedOOO(db, { startDate: start, endDate: end });
-    return json(200, merged);
+    return json(200, await markWeekAgendas(db, merged, start, end));
   }
 
   if (path === '/ooo/range' && method === 'GET') {
@@ -31,13 +32,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
     if (!provider || !start || !end) return json(400, { error: 'provider, start, and end are required.' });
     const merged = await getMergedOOO(db, { startDate: start, endDate: end, provider });
-    return json(200, merged);
+    return json(200, await markWeekAgendas(db, merged, start, end));
   }
 
   if (path === '/ooo' && method === 'GET') {
     const date = qs.date;
     const merged = await getMergedOOO(db, { startDate: date, endDate: date });
-    return json(200, merged);
+    return json(200, await markWeekAgendas(db, merged, date, date));
   }
 
   if (path === '/ooo' && method === 'POST') {
