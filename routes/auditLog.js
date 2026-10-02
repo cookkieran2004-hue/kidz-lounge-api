@@ -1,12 +1,11 @@
 const { json, CORS_HEADERS } = require('../lib/http');
 const { canViewAuditLog } = require('../lib/roles');
-const { hasTable, record, requestMeta } = require('../lib/audit');
+const { hasTable } = require('../lib/audit');
 
 // The HIPAA audit log viewer (lib/audit.js writes it). Developers only.
 //   GET /audit-log?user=&patient=&action=&from=YYYY-MM-DD&to=YYYY-MM-DD&before=<id>&limit=
 //       newest first; `before` pages back through older entries
 //   GET /audit-log?format=csv&...   the same filters as a CSV download
-// Looking at or exporting the log is itself logged.
 
 const COLUMNS = ['at', 'username', 'role', 'action', 'resource', 'patient_name', 'patient_id', 'record_id', 'status', 'ip', 'method', 'path', 'user_agent', 'details'];
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -39,13 +38,6 @@ async function handle({ path, method, qs, db, currentUser, event }) {
      ORDER BY id DESC LIMIT $${params.length}`,
     params
   );
-
-  const filters = Object.fromEntries(['user', 'patient', 'action', 'from', 'to'].filter(k => qs[k]).map(k => [k, qs[k]]));
-  await record(db, {
-    username: currentUser.username, role: currentUser.role,
-    action: csv ? 'export' : 'view', resource: 'audit log', method, path, status: 200,
-    ...requestMeta(event), details: { filters, rows: res.rows.length },
-  });
 
   if (csv) {
     const lines = [COLUMNS.join(','), ...res.rows.map(r => COLUMNS.map(c => csvCell(c === 'at' ? new Date(r.at).toISOString() : r[c])).join(','))];
