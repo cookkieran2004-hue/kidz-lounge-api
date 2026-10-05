@@ -1061,16 +1061,30 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       if (h > 0) taken.push({ id: r.id, when: whenLabel(r), hours: round2(h) });
     }
     const usedSince = round2(taken.reduce((t, x) => t + x.hours, 0));
-    const result = round2(hours - usedSince);
     const client = await db.connect();
     try {
       await client.query('BEGIN');
       const asOfLabel = new Date(`${as_of_date}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      const { after } = await adjustBalance(client, {
-        username, type: 'PTO', setTo: result, kind: 'reset', entryDate: todayStr(), createdBy: currentUser.username,
-        note: `Set to ${hours} h as of ${asOfLabel}${usedSince ? `, less ${usedSince} h of PTO taken since` : ''}`,
+      // History reads: "Manual entry as of <date>: N h", then one "used"
+      // line per request taken since. Drop those requests' existing "used"
+      // lines first so nothing is counted twice.
+      for (const t of taken) await removeUsage(client, { username, type: 'PTO', requestId: t.id });
+      // Re-entering for the same date replaces the earlier entry.
+      await client.query(`DELETE FROM "TimeOffLedger" WHERE username=$1 AND balance_type='PTO' AND kind='reset' AND entry_date=$2`, [username, as_of_date]);
+      await adjustBalance(client, {
+        username, type: 'PTO', setTo: hours, kind: 'reset', entryDate: as_of_date, createdBy: currentUser.username,
+        note: `Entered manually as of ${asOfLabel}`,
         details: { as_of: as_of_date, entered: hours, used_since: usedSince, requests: taken },
       });
+      let after = hours;
+      for (const t of taken) {
+        const r = reqs.find(x => x.id === t.id);
+        const start = String(r.start_date).slice(0, 10);
+        ({ after } = await adjustBalance(client, {
+          username, type: 'PTO', delta: -t.hours, kind: 'used', entryDate: start >= as_of_date ? start : as_of_date,
+          requestId: r.id, note: `PTO ${t.when}`, createdBy: currentUser.username,
+        }));
+      }
       await client.query('COMMIT');
       return json(200, { username, balance_hours: after, entered: hours, as_of_date, used_since: usedSince, requests: taken });
     } catch (err) {
