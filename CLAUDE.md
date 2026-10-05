@@ -4,7 +4,7 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
 
 ## Commands
 
-- No build, test, or lint setup. Plain CommonJS on Node 20. Check that a change loads with `node -e "require('./index.js')"`.
+- No build, test, or lint setup. Plain CommonJS on Node 22 (the Lambda runtime is Node.js 22.x; keep it and `node-version` in `.github/workflows/deploy.yml` in step). Check that a change loads with `node -e "require('./index.js')"`.
 - Deploy: pushing to `main` runs `.github/workflows/deploy.yml`, which copies `index.js`, `lib/`, `routes/` and the package files into `dist/`, runs `npm ci --omit=dev`, and deploys to Lambda through OIDC. **Pushing to main is a production deploy.** Watch the result with `curl -s "https://api.github.com/repos/cookkieran2004-hue/kidz-lounge-api/actions/runs?per_page=5"` (the `gh` CLI isn't installed).
 - A new top-level file or folder is not deployed unless you add it to the workflow's "Package function" step. New files under `lib/` or `routes/` are picked up automatically.
 - `node_modules/` is committed and there's no `.gitignore`. The deploy runs its own `npm ci`, so the committed copy isn't used.
