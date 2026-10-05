@@ -48,8 +48,8 @@ Set up as EventBridge rules on the Lambda (us-east-2). A rule's **name** picks t
 
 | Rule / job name | Schedule (UTC) | Code |
 |---|---|---|
-| `pto-weekly-accrual` | `cron(0 12 ? * SUN *)` | `lib/ptoAccrual.js` `runWeeklyPtoAccrual` |
-| `time-off-accrual` | `cron(0 12 1 * ? *)` | `lib/timeOffAccrual.js` (monthly UPTO only) |
+| `pto-weekly-accrual` | `cron(0 12 ? * SUN *)` | `lib/ptoAccrual.js` `runWeeklyPtoAccrual` (accrual paused: only the year-end carryover) |
+| `time-off-accrual` | `cron(0 12 1 * ? *)` | `lib/timeOffAccrual.js` (monthly UPTO; off, `MONTHLY_UPTO_ENABLED = false`) |
 | `compliance-check` | daily, e.g. `cron(0 11 * * ? *)` | `lib/complianceCheck.js` |
 | `chat-deletion` (any other name) | daily | 72-hour chat cleanup in `index.js` |
 
@@ -57,7 +57,11 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
 
 ## Time off (PTO / UPTO)
 
-- **PTO** is earned **weekly**: every Sunday, 0.08h per estimated hour worked Monday-Friday of the week just ended (`lib/ptoAccrual.js`). Missed weeks are caught up, and a week is never credited twice (the ledger's unique index on `period_start`). A week spanning New Year is split so the carryover trim happens between the halves.
+- **Current policy (Oct 2026):**
+  - **Employment type** (`Staff.employment_type`, migration `2026-10-12_employment_type.sql`, `lib/employment.js`): `salaried` gets PTO + UPTO, `hourly` UPTO only, `neither` no PTO/UPTO (the default). `balanceTypeRefusal` blocks a disallowed type on create, edit and approve. Before the migration everyone is treated as salaried.
+  - **PTO is set, not earned.** Weekly accrual is paused (`WEEKLY_ACCRUAL_ENABLED = false` in `lib/ptoAccrual.js`; move `POLICY_START` forward before turning it back on). Admins set a balance "as of" a date with `PUT /time-off/balances/as-of` `{ username, hours, as_of_date }` (salaried only, 0-120h, not in the future): balance = hours minus approved PTO charged from that date on (`chargeHoursFor(..., fromDate)` for requests that straddle it), ledgered as kind `reset`. The cap, year-end carryover, two-week limit and negative balances with approval still apply.
+  - **UPTO is unlimited.** Approving UPTO stores `charged_hours` but doesn't touch the balance or ledger; `uptoUsedThisYear` sums approved UPTO for display.
+- **Weekly accrual (paused; kept for when it returns).** PTO was earned **weekly**: every Sunday, 0.08h per estimated hour worked Monday-Friday of the week just ended (`lib/ptoAccrual.js`). Missed weeks are caught up, and a week is never credited twice (the ledger's unique index on `period_start`). A week spanning New Year is split so the carryover trim happens between the halves.
   - **Hours worked are estimated from the schedule** (`lib/workSchedule.js`; there are no timesheets).
     - **Providers:** contracted hours (`ProviderUsualSchedule` plus scheduled changes), minus office closures and approved PTO/UPTO/Unavailable/Other time, plus sessions outside scheduled hours. Lunch and meetings count as worked.
     - **A provider's day with no patients seen counts as 0.** A patient isn't seen if nothing is booked, or every session is Canceled, No Show, `*HOLD*`, or the "HOLD - see comments" placeholder patient.
@@ -65,7 +69,7 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - **Balance cap:** accrual stops at a 120h balance.
   - **Year end:** on Dec 31 a PTO balance over 40h is cut to 40.
   - **Constants** (`PTO_RATE`, `PTO_BALANCE_CAP`, `PTO_CARRYOVER_MAX`, `POLICY_START = '2026-09-01'`) live in `lib/workSchedule.js`. The frontend reads them from `GET /time-off/policy`, so there's one source of truth.
-- **UPTO** is a flat 40h/yr, 3.25h credited on the 1st of each month (`lib/timeOffAccrual.js`, which uses `last_accrued_month` to skip repeats).
+- **UPTO (off)** was a flat 40h/yr, 3.25h credited on the 1st of each month (`lib/timeOffAccrual.js`, which uses `last_accrued_month` to skip repeats).
 - **What a request costs** is the scheduled hours it covers, not clock hours: a Mon-Fri week is 40h, not 104h. The cost is `chargeHoursFor` in `lib/workSchedule.js`, stored on the request as `charged_hours` (an estimate when filed, fixed at approval) so a refund matches exactly. `hoursBetween` (clock hours) survives only for older requests without `charged_hours`.
 - **Two-week limit:** PTO in a row (this request plus adjacent PTO, bridging non-workdays) can't exceed 2 × the person's scheduled weekly hours (`consecutivePtoCheck`). Extra days go in as UPTO.
 - **Changing an approved PTO/UPTO request** cancels the original immediately (hours refunded, blocks removed, row deleted) and files the change as a plain new request, with no `replaces_request_id`. Other types keep the linked "change request" flow, where the original stays until approval.
@@ -75,7 +79,7 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - `GET /time-off/ledger` works each row's displayed balance back from the current balance, so the history always adds up.
   - Only PTO/UPTO are ledgered. Pre-redesign request types (Vacation/Sick/Personal, still `is_balance_type`) adjust their retired balances without ledger entries.
 - **Admins can correct a week's hours worked** (`PUT /time-off/ledger/:id/hours`, `editWeekHours` in `lib/ptoAccrual.js`, from the day-by-day table in Balance history). The credit is re-worked at 0.08/h (an increase still stops at the 120h cap), the difference goes onto today's balance, and the accrual entry is changed in place with `details.edited` (who, when, reason) and each changed day's original `estimated` hours. `recalculate_pto_weeks.js` skips edited weeks.
-- **Endpoints:** `GET /time-off/balances/all` (admin: every active employee's PTO/UPTO, pending hours, weekly scheduled hours and credit), `GET /time-off/policy` (rates plus the person's weekly scheduled hours), `/time-off/ledger`, and `/time-off/estimate` (the cost of a span, for the request form).
+- **Endpoints:** `GET /time-off/balances/all` (admin: every active employee's `employment_type`, PTO, `upto_used_this_year`, pending hours, weekly scheduled hours and credit), `GET /time-off/policy` (rates, the person's weekly scheduled hours, `employment_type`, `weekly_accrual`, `upto_unlimited`, `upto_used_this_year`), `PUT /time-off/balances/as-of`, `/time-off/ledger`, and `/time-off/estimate` (the cost of a span, for the request form).
 - The one-time Sep 1 2026 reset (`../kidz-lounge-scripts/reset_time_off_2026_09_01.js`) has been applied. `recalculate_pto_weeks.js` re-credits past weeks after a rule change.
 
 ## Data model gotchas

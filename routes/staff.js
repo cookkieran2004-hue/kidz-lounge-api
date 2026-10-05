@@ -1,5 +1,15 @@
 const bcrypt = require('bcryptjs');
 const { canManage, canAdminister, canCaseManage, ROLES } = require('../lib/roles');
+const { EMPLOYMENT_TYPES, hasEmploymentColumn } = require('../lib/employment');
+
+// Sets employment_type when the request includes a valid one (and the
+// column exists). Returns the value saved, or undefined.
+async function saveEmploymentType(q, staffId, body) {
+  if (!Object.prototype.hasOwnProperty.call(body, 'employment_type')) return undefined;
+  if (!(await hasEmploymentColumn(q))) return undefined;
+  await q.query('UPDATE "Staff" SET employment_type=$1 WHERE id=$2', [body.employment_type, staffId]);
+  return body.employment_type;
+}
 const { json } = require('../lib/http');
 const { HttpError, syncLinkedProvider, assertProviderNotLinkedElsewhere } = require('../lib/providerNames');
 const { verifyAdminPassword } = require('../lib/auth');
@@ -115,7 +125,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!canManage(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT id, username, role, provider_name, must_reset_password, created_at, last_login,
-              first_name, middle_name, last_name, preferred_name, position, archived, hire_date
+              first_name, middle_name, last_name, preferred_name, position, archived, hire_date${(await hasEmploymentColumn(db)) ? ', employment_type' : ''}
        FROM "Staff" ORDER BY archived, username`
     );
     return json(200, result.rows);
@@ -124,6 +134,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/auth/users' && method === 'POST') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { first_name, middle_name, last_name, preferred_name, position, temporary_password, role, provider_name, admin_password, hire_date } = body;
+    if (body.employment_type !== undefined && !EMPLOYMENT_TYPES.includes(body.employment_type)) {
+      return json(400, { error: 'Employment type must be Salaried, Hourly or Neither.' });
+    }
     if (!(await verifyAdminPassword(db, currentUser, admin_password))) {
       return json(401, { error: 'Incorrect password. Please re-enter your password to confirm this change.' });
     }
@@ -161,6 +174,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         [username, passwordHash, ROLES.includes(role) ? role : 'staff', provider_name || null, first_name.trim(), middle_name.trim(), last_name.trim(), preferred_name?.trim() || null, position.trim(), hire_date || null]
       );
       const created = result.rows[0];
+      const savedType = await saveEmploymentType(client, created.id, body);
+      if (savedType) created.employment_type = savedType;
       const syncedName = await syncLinkedProvider(client, created);
       if (syncedName) created.provider_name = syncedName;
       await client.query('COMMIT');
@@ -180,6 +195,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const { role, reset_temporary_password, provider_name, admin_password, first_name, middle_name, last_name, preferred_name, position, archived, hire_date } = body;
     if (role !== undefined && role !== null && role !== '' && !ROLES.includes(role)) {
       return json(400, { error: `Role must be one of: ${ROLES.join(', ')}.` });
+    }
+    if (body.employment_type !== undefined && !EMPLOYMENT_TYPES.includes(body.employment_type)) {
+      return json(400, { error: 'Employment type must be Salaried, Hourly or Neither.' });
     }
     if (!(await verifyAdminPassword(db, currentUser, admin_password))) {
       return json(401, { error: 'Incorrect password. Please re-enter your password to confirm this change.' });
@@ -227,6 +245,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     );
     const updated = result.rows[0];
     if (!updated) { await client.query('ROLLBACK'); return json(404, { error: 'Staff account not found.' }); }
+    const savedType = await saveEmploymentType(client, updated.id, body);
+    if (savedType) updated.employment_type = savedType;
     // Admins and developers may change anyone's role, their own included,
     // but someone has to be left who can reach the Admin area -- otherwise
     // nobody could ever change a role back.

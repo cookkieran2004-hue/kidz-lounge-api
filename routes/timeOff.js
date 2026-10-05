@@ -6,8 +6,9 @@ const {
   PTO_RATE, PTO_BALANCE_CAP, PTO_CARRYOVER_MAX, POLICY_START,
   chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, mondayOf, addDays, round2,
 } = require('../lib/workSchedule');
-const { adjustBalance, removeUsage, hasLedgerTable, editWeekHours } = require('../lib/ptoAccrual');
+const { adjustBalance, removeUsage, hasLedgerTable, editWeekHours, WEEKLY_ACCRUAL_ENABLED } = require('../lib/ptoAccrual');
 const { UPTO_MONTHLY_HOURS } = require('../lib/timeOffAccrual');
+const { balanceTypeRefusal, employmentTypeOf, hasEmploymentColumn } = require('../lib/employment');
 
 const BALANCE_TYPES = new Set(['PTO', 'UPTO']);
 const BALANCE_NEUTRAL_TYPES = new Set(['Lunch', 'Meeting', 'Unavailable', 'Other']);
@@ -225,11 +226,15 @@ async function applyApproval(q, reqRow, reviewerUsername) {
     // may have changed since it was filed) and stored so a refund matches.
     const hoursUsed = await chargeHoursFor(q, reqRow.username, reqRow);
     if (await hasChargedColumn(q)) await q.query('UPDATE "TimeOffRequests" SET charged_hours=$1 WHERE id=$2', [hoursUsed, reqRow.id]);
-    const { after } = await adjustBalance(q, {
-      username: reqRow.username, type: reqRow.request_type, delta: -hoursUsed, kind: 'used',
-      entryDate: reqRow.start_date, requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)}`, createdBy: reviewerUsername,
-    });
-    newBalance = after;
+    // UPTO is unlimited (Oct 2026): no balance to take it from. Its hours
+    // are only counted (charged_hours, "UPTO used this year").
+    if (reqRow.request_type !== 'UPTO') {
+      const { after } = await adjustBalance(q, {
+        username: reqRow.username, type: reqRow.request_type, delta: -hoursUsed, kind: 'used',
+        entryDate: reqRow.start_date, requestId: reqRow.id, note: `${reqRow.request_type} ${whenLabel(reqRow)}`, createdBy: reviewerUsername,
+      });
+      newBalance = after;
+    }
   }
 
   const updateRes = await q.query(
@@ -245,6 +250,20 @@ function addDaysStr(dateStr, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
+// UPTO is unlimited (Oct 2026), so instead of a balance each person's
+// approved UPTO hours this calendar year are counted. username -> hours.
+async function uptoUsedThisYear(db, usernames = null) {
+  const year = todayStr().slice(0, 4);
+  const res = await db.query(
+    `SELECT * FROM "TimeOffRequests" WHERE status = 'approved' AND request_type = 'UPTO' AND is_balance_type
+       AND start_date >= $1::date AND start_date < ($1::date + interval '1 year') ${usernames ? 'AND username = ANY($2)' : ''}`,
+    usernames ? [`${year}-01-01`, usernames] : [`${year}-01-01`]
+  );
+  const used = {};
+  for (const r of res.rows) used[r.username] = round2((used[r.username] || 0) + hoursTaken(r));
+  return used;
+}
+
 function todayStr() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -294,7 +313,8 @@ async function undoApproval(q, reqRow, keepBefore = null) {
     }
     // Deleted or replaced: its deduction comes out of the history entirely.
     // Only an older request with no history entry leaves a refund behind.
-    const removed = await removeUsage(q, { username: reqRow.username, type: reqRow.request_type, requestId: reqRow.id });
+    // UPTO no longer has a balance, so there's nothing to give back.
+    const removed = reqRow.request_type === 'UPTO' || await removeUsage(q, { username: reqRow.username, type: reqRow.request_type, requestId: reqRow.id });
     if (!removed) {
       await adjustBalance(q, {
         username: reqRow.username, type: reqRow.request_type, delta: hoursTaken(reqRow), kind: 'refund',
@@ -468,6 +488,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
     if (!ALL_TYPES.has(request_type)) return json(400, { error: 'Unknown request type.' });
     const isBalanceType = BALANCE_TYPES.has(request_type);
+    {
+      const forUsername = targetUsername || (original ? original.username : currentUser.username);
+      const refusal = await balanceTypeRefusal(db, forUsername, request_type, forUsername === currentUser.username);
+      if (refusal) return json(400, { error: refusal });
+    }
 
     if (isBalanceType && is_recurring) {
       return json(400, { error: `${request_type} requests can't be recurring -- they're always a one-time span.` });
@@ -550,7 +575,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       }
     }
 
-    if (isBalanceType && !confirm_negative_balance) {
+    if (isBalanceType && request_type !== 'UPTO' && !confirm_negative_balance) {
       const hoursRequested = await chargeHoursFor(db, targetUsername, { ...fields, is_balance_type: true });
       // A change gives back the original's hours first (same balance type).
       const refund = original && original.is_balance_type && original.request_type === request_type ? hoursTaken(original) : 0;
@@ -821,6 +846,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const reqRow = reqRes.rows[0];
     if (!reqRow) return json(404, { error: 'Request not found.' });
     if (reqRow.status !== 'pending') return json(409, { error: `This request has already been ${reqRow.status}.` });
+    // Their employment type may have changed since they asked.
+    const refusal = await balanceTypeRefusal(db, reqRow.username, reqRow.request_type, false);
+    if (refusal) return json(400, { error: `${refusal} Deny this request, or change their employment type first.` });
 
     try {
       const approved = await inTransaction(db, (client) => approveWithReplacement(client, reqRow, currentUser.username));
@@ -883,6 +911,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
     if (request_type === 'Other' && !(notes || '').trim()) {
       return json(400, { error: 'Please specify what "Other" is for.' });
+    }
+    {
+      const owner = existingRes.rows[0].username;
+      const refusal = await balanceTypeRefusal(db, owner, request_type, owner === currentUser.username);
+      if (refusal) return json(400, { error: refusal });
     }
     try {
       await assertConsecutivePtoLimit(db, existingRes.rows[0].username, { request_type, start_date, end_date, start_time, end_time }, [id]);
@@ -955,10 +988,12 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // with the PTO they earn. Active staff only.
   if (path === '/time-off/balances/all' && method === 'GET') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    const hasType = await hasEmploymentColumn(db);
     const staffRes = await db.query(
-      `SELECT username, provider_name, hire_date, archived, first_name, middle_name, last_name, preferred_name
+      `SELECT username, provider_name, hire_date, archived, first_name, middle_name, last_name, preferred_name${hasType ? ', employment_type' : ''}
        FROM "Staff" WHERE archived = false`
     );
+    const uptoUsed = await uptoUsedThisYear(db);
     const balRes = await db.query(`SELECT username, balance_type, balance_hours FROM "TimeOffBalances" WHERE balance_type IN ('PTO', 'UPTO')`);
     const pendingRes = await db.query(
       `SELECT * FROM "TimeOffRequests" WHERE status = 'pending' AND request_type IN ('PTO', 'UPTO')`
@@ -980,8 +1015,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         username: staff.username,
         display_name: displayNameFor(staff),
         provider_name: staff.provider_name || null,
+        employment_type: hasType ? staff.employment_type : 'salaried',
         pto: bal[staff.username]?.PTO ?? 0,
-        upto: bal[staff.username]?.UPTO ?? 0,
+        upto_used_this_year: uptoUsed[staff.username] ?? 0,
         pending_pto: pending[staff.username]?.PTO ?? 0,
         pending_upto: pending[staff.username]?.UPTO ?? 0,
         weekly_scheduled_hours: weekly,
@@ -990,6 +1026,59 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
     rows.sort((x, y) => x.display_name.localeCompare(y.display_name));
     return json(200, { rows, balance_cap: PTO_BALANCE_CAP });
+  }
+
+  // Set someone's PTO "as of" a date (Oct 2026 policy: no weekly accrual).
+  // The admin enters the balance they had on that date; approved PTO taken
+  // from that date on (future approved PTO included -- it's taken off when
+  // approved) is subtracted, and the result becomes their balance, recorded
+  // in their history with the working. Salaried staff only; at most the
+  // 120-hour cap. Body: { username, hours, as_of_date }.
+  if (path === '/time-off/balances/as-of' && method === 'PUT') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    const { username, as_of_date } = body;
+    const hours = Number(body.hours);
+    if (!username) return json(400, { error: 'Whose balance? username is required.' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(as_of_date || '')) return json(400, { error: 'Choose the date the balance is as of.' });
+    if (as_of_date > todayStr()) return json(400, { error: "The \"as of\" date can't be in the future." });
+    if (!Number.isFinite(hours) || hours < 0) return json(400, { error: 'Enter the PTO hours as a number, 0 or more.' });
+    if (hours > PTO_BALANCE_CAP) return json(400, { error: `A PTO balance can't be more than ${PTO_BALANCE_CAP} hours.` });
+    const staffRes = await db.query('SELECT username FROM "Staff" WHERE username=$1', [username]);
+    if (!staffRes.rows[0]) return json(404, { error: 'No such staff account.' });
+    if ((await employmentTypeOf(db, username)) !== 'salaried') {
+      return json(400, { error: 'PTO is only for salaried staff. Set their employment type to Salaried first.' });
+    }
+    const reqs = (await db.query(
+      `SELECT * FROM "TimeOffRequests"
+       WHERE username=$1 AND status='approved' AND request_type='PTO' AND is_balance_type AND end_date >= $2
+       ORDER BY start_date`,
+      [username, as_of_date]
+    )).rows;
+    const taken = [];
+    for (const r of reqs) {
+      const start = String(r.start_date).slice(0, 10);
+      const h = start >= as_of_date ? hoursTaken(r) : await chargeHoursFor(db, username, r, as_of_date);
+      if (h > 0) taken.push({ id: r.id, when: whenLabel(r), hours: round2(h) });
+    }
+    const usedSince = round2(taken.reduce((t, x) => t + x.hours, 0));
+    const result = round2(hours - usedSince);
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const asOfLabel = new Date(`${as_of_date}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const { after } = await adjustBalance(client, {
+        username, type: 'PTO', setTo: result, kind: 'reset', entryDate: todayStr(), createdBy: currentUser.username,
+        note: `Set to ${hours} h as of ${asOfLabel}${usedSince ? `, less ${usedSince} h of PTO taken since` : ''}`,
+        details: { as_of: as_of_date, entered: hours, used_since: usedSince, requests: taken },
+      });
+      await client.query('COMMIT');
+      return json(200, { username, balance_hours: after, entered: hours, as_of_date, used_since: usedSince, requests: taken });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   if (path === '/time-off/balances' && method === 'PUT') {
@@ -1083,7 +1172,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const monday = mondayOf(today);
     const schedule = await loadSchedule(db, staff, monday, addDays(monday, 6));
     const weekly = weeklyScheduledHours(schedule, today);
+    const uptoUsed = await uptoUsedThisYear(db, [targetUsername]);
     return json(200, {
+      // Oct 2026: PTO for salaried staff only, set "as of" a date (no weekly
+      // accrual); UPTO unlimited for salaried and hourly, counted not balanced.
+      employment_type: await employmentTypeOf(db, targetUsername),
+      weekly_accrual: WEEKLY_ACCRUAL_ENABLED,
+      upto_unlimited: true,
+      upto_used_this_year: uptoUsed[targetUsername] ?? 0,
       schedule_kind: schedule.kind,
       weekly_scheduled_hours: weekly,
       pto: {
