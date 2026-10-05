@@ -12,7 +12,7 @@ const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 // patient locked onto the sheet by a day that has ended -- lib/pastLock.js).
 // A day's mark, once the day has ended:
 //   H / Z  the office was closed (closure_type holiday / emergency)
-//   PA     the provider had PTO/UPTO/Unavailable (etc.) over the session
+//   PA     the provider had PTO/UPTO/Unavailable/Other (etc.) over the session
 //   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
 //   A      child absent (No Show, Canceled)
 //   M      make-up (Make Up, MUS)
@@ -22,7 +22,7 @@ const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 // listed for Admins/Developers to approve (replayed as them) or deny.
 
 const HOLD_PATIENT = 'hold - see comments';
-const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Vacation', 'Sick', 'Personal']);
+const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Other', 'Vacation', 'Sick', 'Personal']);
 const STATUS_MARK = {
   Scheduled: 'X', Confirmed: 'X', 'Left Message': 'X', Emailed: 'X',
   'No Show': 'A', Canceled: 'A',
@@ -97,6 +97,9 @@ async function buildSheet(db, provider, month) {
     const e = s + (Number(a.duration) || 30);
     return mins(o.start_time) < e && s < mins(o.end_time);
   });
+  // Order matters: a closure, then the provider being out, win over the
+  // session's status -- a session Canceled (or No Show) while the provider
+  // was on PTO/UPTO/Unavailable is PA, not A.
   const markFor = (a) => {
     const date = String(a.appointment_date).slice(0, 10);
     if (date >= today) return null; // the day hasn't ended yet
