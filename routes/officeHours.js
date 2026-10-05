@@ -130,10 +130,12 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const { closure_date, reason } = body;
     if (!closure_date) return json(400, { error: 'closure_date is required.' });
-    const closureRes = await db.query(
-      'INSERT INTO "OfficeClosures" (closure_date, reason) VALUES ($1,$2) RETURNING *',
-      [closure_date, reason || null]
-    );
+    // Holiday (H on the billing sheet) or emergency closure (Z).
+    const closureType = body.closure_type === 'emergency' ? 'emergency' : 'holiday';
+    const hasType = (await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name='OfficeClosures' AND column_name='closure_type'`)).rows.length > 0;
+    const closureRes = hasType
+      ? await db.query('INSERT INTO "OfficeClosures" (closure_date, reason, closure_type) VALUES ($1,$2,$3) RETURNING *', [closure_date, reason || null, closureType])
+      : await db.query('INSERT INTO "OfficeClosures" (closure_date, reason) VALUES ($1,$2) RETURNING *', [closure_date, reason || null]);
     return json(201, closureRes.rows[0]);
   }
 

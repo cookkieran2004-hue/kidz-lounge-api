@@ -2,8 +2,17 @@ const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments } = require('../lib/recurring');
+const pastLock = require('../lib/pastLock');
 
-async function handle({ path, method, qs, body, db, currentUser }) {
+async function handle(ctx) {
+  const { path, method, qs, body, db, currentUser } = ctx;
+  // Past dates are locked for billing (lib/pastLock.js): status changes go
+  // through; anything else needs an Admin/Developer, or becomes a request.
+  if (method !== 'GET' && (path.startsWith('/appointments') || path.startsWith('/recurring-series'))) {
+    const blocked = await pastLock.guard(ctx);
+    if (blocked) return blocked;
+  }
+
   // Unrestricted, all-providers, date-range window -- used for the 4-week
   // scheduling-conflict lookahead on the main Schedule page. Unlike
   // /appointments/range, this is not provider-scoped or access-restricted,

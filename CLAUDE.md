@@ -127,3 +127,13 @@ Show the results before shipping.
 - 2-space indent, single quotes, semicolons, parameterized queries only (`$1, $2`).
 - User-facing error messages are plain-English sentences, because staff read them directly in the UI. Say what to do next ("Request the extra days as UPTO instead").
 - Commit messages: a short summary line, then a paragraph on what changed and why, ending with the `Co-Authored-By` trailer.
+
+## Billing and the past-date lock (Oct 2026)
+
+- **`GET /billing?provider=&month=YYYY-MM`** (`routes/billing.js`): one provider's month for the Billing page. Same access as `/appointments/range` (staff: own provider only). A row for each patient with appointments that month, plus any patient in `BillingCaseload`. Groups: EI, DOE (CPSE/CSE), Insurance, Other (from `Patients.Program`). Setting `C` = any session in an in-office room (not Offsite, not unset). Rate and $ totals are left blank for now.
+  - Day marks are set only once the day has ended in clinic time (`clinicToday()`, America/New_York). In order: `H`/`Z` = office closure (`OfficeClosures.closure_type` holiday/emergency), `PA` = provider PTO/UPTO/Unavailable (or the old Vacation/Sick/Personal types) overlapping the session, then status (`X` Scheduled/Confirmed/Left Message/Emailed, `A` No Show/Canceled, `M` Make Up/MUS). `*HOLD*` and the HOLD placeholder are skipped.
+  - Building a sheet locks every patient seen on a day that has ended into `BillingCaseload`, so they stay on that month's sheet. `PUT /billing/review` sets the REVIEWED box (Admin/Developer).
+- **Past-date lock** (`lib/pastLock.js`, run first in `routes/appointments.js` for every non-GET): on a date that has ended, anyone may change the status or comments. Anything else (add, move, re-time, provider/room/length, delete, ending or purging a series that removes past dates, past exceptions with changes) is only for Admin/Developer, who make the change directly; the patient is locked onto the sheet first.
+  - Everyone else gets 409 `{ code: 'pastLocked', summary }`. The frontend (`src/api.js` + `src/PastLockDialog.jsx`) asks for a reason and resends with `?approval_reason=`, which files a `ScheduleChangeRequests` row and returns 202 `{ pending: true }`.
+  - Admin → Schedule changes approves (`PUT /schedule-change-requests/:id/approve`, which replays the stored method/path/body through `routes/appointments.js` as the approver with `skipPastLock`) or denies.
+- Migration: `2026-10-13_billing.sql`. The code checks for the tables first, so it runs before the migration (no locking rows or requests until then).

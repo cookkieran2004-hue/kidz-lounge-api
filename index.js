@@ -34,6 +34,7 @@ const officeHoursRoutes = require('./routes/officeHours');
 const supportRoutes = require('./routes/support');
 const waitlistRoutes = require('./routes/waitlist');
 const auditLogRoutes = require('./routes/auditLog');
+const billingRoutes = require('./routes/billing');
 const audit = require('./lib/audit');
 
 // Tried in this order for every authenticated request; the first module to
@@ -42,7 +43,7 @@ const audit = require('./lib/audit');
 // but grouping stays roughly domain-by-domain for readability.
 const ROUTE_MODULES = [
   staffRoutes, providerRoutes, patientRoutes, appointmentRoutes,
-  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes,
+  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes,
 ];
 
 // Which scheduled job an EventBridge event is for: its `job` (a rule with a
