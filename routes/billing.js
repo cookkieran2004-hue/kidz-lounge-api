@@ -32,12 +32,14 @@ const DISCIPLINE = { ST: 'Speech Therapy', OT: 'Occupational Therapy', PT: 'Phys
 const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
 const pad = (n) => String(n).padStart(2, '0');
 
+// Programs on the Other section (P and PP included -- not insurance).
+const OTHER_PROGRAMS = new Set(['P', 'PP', 'NONE', 'PRIVATE', 'SELF PAY', 'OTHER']);
 // EI, DOE (CPSE/CSE), Insurance, or Other.
 function groupFor(program) {
   const parts = String(program || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
   if (parts.includes('EI')) return 'EI';
   if (parts.some(p => p === 'CPSE' || p === 'CSE' || p === 'DOE')) return 'DOE';
-  if (!parts.length || parts.every(p => p === 'NONE' || p === 'PRIVATE' || p === 'SELF PAY' || p === 'OTHER')) return 'Other';
+  if (!parts.length || parts.every(p => OTHER_PROGRAMS.has(p))) return 'Other';
   return 'Insurance';
 }
 // An in-office room (not offsite, not unset).
