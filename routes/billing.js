@@ -2,6 +2,7 @@ const { json } = require('../lib/http');
 const { canManage, canAdminister } = require('../lib/roles');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
 const pastLock = require('../lib/pastLock');
+const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
 const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 
 // Billing sheets (Oct 2026): one provider's month, laid out like the paper
@@ -104,8 +105,9 @@ async function buildSheet(db, provider, month) {
   // was on PTO/UPTO/Unavailable is PA, not A.
   const markFor = (a) => {
     const date = String(a.appointment_date).slice(0, 10);
-    if (date >= today) return null; // the day hasn't ended yet
+    // A closure is known in advance, so it shows even before the day ends.
     if (closures[date]) return closures[date].type === 'emergency' ? 'Z' : 'H';
+    if (date >= today) return null; // the day hasn't ended yet
     if (providerAbsent(a)) return 'PA';
     return STATUS_MARK[a.appointment_status] || 'X';
   };
@@ -115,10 +117,13 @@ async function buildSheet(db, provider, month) {
     const mine = appts.filter(a => a.patient_name === name);
     const days = {};
     let provided = 0;
+    let scheduled = 0;
     for (const a of mine) {
       const d = Number(String(a.appointment_date).slice(8, 10));
       const mark = markFor(a);
       if (mark === 'X' || mark === 'M') provided += 1;
+      // Sessions on a closed day (H or Z) still show, but aren't scheduled.
+      if (mark !== 'H' && mark !== 'Z') scheduled += 1;
       (days[d] = days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
     }
     const p = patientByName[name] || {};
@@ -129,7 +134,7 @@ async function buildSheet(db, provider, month) {
       group: groupFor(p.Program),
       setting: mine.some(a => inOffice(a.treatment_area)) ? 'C' : '',
       days,
-      scheduled: mine.length,
+      scheduled,
       total_sessions: provided,
       locked: lockedSet.has(name),
     };
@@ -140,6 +145,7 @@ async function buildSheet(db, provider, month) {
     reviewed = (await db.query('SELECT reviewed_by, reviewed_at FROM "BillingReviews" WHERE provider=$1 AND month=$2', [provider, start])).rows[0] || null;
   }
   const spec = providerRes.rows[0]?.specialty || '';
+  const timeOff = await timeOffHours(db, provider, start, end);
   return {
     provider,
     month,
@@ -152,7 +158,40 @@ async function buildSheet(db, provider, month) {
     closures,
     rows,
     reviewed,
+    time_off: timeOff,
   };
+}
+
+// The provider's approved PTO and UPTO for days in the month, in hours --
+// the same scheduled-hours cost as the request itself (lib/workSchedule.js),
+// counting only a cross-month request's days in this month.
+async function timeOffHours(db, provider, start, end) {
+  const out = { PTO: 0, UPTO: 0, requests: [] };
+  const staff = (await db.query(
+    'SELECT username, provider_name, hire_date, archived FROM "Staff" WHERE provider_name=$1 ORDER BY archived LIMIT 1', [provider]
+  )).rows[0];
+  if (!staff) return out;
+  const reqs = (await db.query(
+    `SELECT * FROM "TimeOffRequests"
+     WHERE username=$1 AND status='approved' AND is_balance_type AND request_type IN ('PTO', 'UPTO')
+       AND start_date <= $3 AND end_date >= $2
+     ORDER BY start_date`,
+    [staff.username, start, end]
+  )).rows;
+  if (!reqs.length) return out;
+  const day = (v) => String(v).slice(0, 10);
+  const lo = reqs.reduce((m, r) => (day(r.start_date) < m ? day(r.start_date) : m), start);
+  const hi = reqs.reduce((m, r) => (day(r.end_date) > m ? day(r.end_date) : m), end);
+  const schedule = await loadSchedule(db, staff, lo, hi);
+  for (const r0 of reqs) {
+    const r = { ...r0, start_date: day(r0.start_date), end_date: day(r0.end_date) };
+    const from = r.start_date > start ? r.start_date : start;
+    const hours = round2(chargeForRequest(schedule, r, from) - (r.end_date > end ? chargeForRequest(schedule, r, addDays(end, 1)) : 0));
+    if (hours <= 0) continue;
+    out[r.request_type] = round2(out[r.request_type] + hours);
+    out.requests.push({ type: r.request_type, start_date: from, end_date: r.end_date > end ? end : r.end_date, hours });
+  }
+  return out;
 }
 
 async function handle(ctx) {
