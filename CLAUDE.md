@@ -137,3 +137,10 @@ Show the results before shipping.
   - Everyone else gets 409 `{ code: 'pastLocked', summary }`. The frontend (`src/api.js` + `src/PastLockDialog.jsx`) asks for a reason and resends with `?approval_reason=`, which files a `ScheduleChangeRequests` row and returns 202 `{ pending: true }`.
   - Admin → Schedule changes approves (`PUT /schedule-change-requests/:id/approve`, which replays the stored method/path/body through `routes/appointments.js` as the approver with `skipPastLock`) or denies.
 - Migration: `2026-10-13_billing.sql`. The code checks for the tables first, so it runs before the migration (no locking rows or requests until then).
+
+## Patient programs and mandates (Oct 2026)
+
+- `PatientPrograms` (migration `2026-10-14_patient_programs.sql`, `lib/patientPrograms.js`): one row per program × service with its mandate (`sessions` '2' or '1-2' per week × `minutes`) and `start_date` / `end_date` (NULL = from the beginning / current). A program with no mandate yet is a row with `service` NULL. Patients brought over by the migration keep their old free-text Mandate on those rows as `legacy_mandate`.
+- A service can only be under one program at a time (`cleanPlan`).
+- Saving: `POST /patients` and `PUT /patients/:id` take `program_plan: { effective_from, programs: [{ program, mandates: [{ service, sessions, minutes }] }] }`. `applyPlan` leaves unchanged rows alone, ends changed or removed ones the day before `effective_from` (or deletes them when they'd start on or after it), and starts new ones on it. A new patient has no date (covers everything). It then rewrites `Patients.Program` / `Mandate` as a summary of what's current. `GET /patients/:id/programs` lists the history (`id` 'new' just reports availability).
+- Billing (`routes/billing.js`) picks the program in effect on each session's date for the provider's discipline (`programFor`: that service, else a program with no mandate yet, else any; ties in billing order). A program or mandate change mid-month gives the child a row for each.

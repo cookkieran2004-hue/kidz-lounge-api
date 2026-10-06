@@ -1,4 +1,5 @@
 const { json } = require('../lib/http');
+const patientPrograms = require('../lib/patientPrograms');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
 const { canCaseManage } = require('../lib/roles');
@@ -105,6 +106,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       Status, SC_Admin_Phone, SC_Admin_Email, Google_Link,
     } = body;
     if (!Name || !Name.trim()) return json(400, { error: 'Name is required' });
+    // Programs with a mandate per service (lib/patientPrograms.js). A new
+    // patient's programs cover all their appointments (no start date).
+    let plan = null;
+    if (body.program_plan && (await patientPrograms.hasProgramsTable(db))) {
+      const cleaned = patientPrograms.cleanPlan({ ...body.program_plan, effective_from: null });
+      if (cleaned.error) return json(400, { error: cleaned.error });
+      plan = cleaned.plan;
+    }
     // MRN is always generated here, never accepted from the client -- it's
     // the patient's permanent, computer-assigned unique identifier.
     const mrn = await generateUniqueMRN(db);
@@ -125,8 +134,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         Status || null, SC_Admin_Phone || null, SC_Admin_Email || null, Google_Link || null,
       ]
     );
-    const withAlerts = (await hasAlertColumns(db)) ? await saveAlertFields(db, result.rows[0].id, body) : null;
-    return json(201, withAlerts || result.rows[0]);
+    let created = result.rows[0];
+    if (plan) {
+      await patientPrograms.applyPlan(db, created.id, plan, currentUser.username);
+      created = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [created.id])).rows[0];
+    }
+    const withAlerts = (await hasAlertColumns(db)) ? await saveAlertFields(db, created.id, body) : null;
+    return json(201, withAlerts || created);
   }
 
   if (path === '/patients/search' && method === 'GET') {
@@ -143,6 +157,19 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       [`%${q}%`]
     );
     return json(200, result.rows);
+  }
+
+  // A patient's program history (current and past), for the patient form and chart.
+  if (path.match(/^\/patients\/[^/]+\/programs$/) && method === 'GET') {
+    const id = path.split('/')[2];
+    if (!(await patientPrograms.hasProgramsTable(db))) return json(200, { available: false, rows: [] });
+    if (id === 'new') return json(200, { available: true, rows: [] }); // a patient not saved yet
+    const rows = (await db.query(
+      `SELECT id, program, service, sessions, minutes, start_date, end_date, created_by, created_at, ended_by, legacy_mandate
+       FROM "PatientPrograms" WHERE patient_id=$1 ORDER BY end_date IS NOT NULL, start_date DESC NULLS LAST, program, service`,
+      [id]
+    )).rows;
+    return json(200, { available: true, rows });
   }
 
   if (path.match(/^\/patients\/[^/]+\/appointments$/) && method === 'GET') {
@@ -236,9 +263,20 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       if (oldName !== newName) {
         await client.query('UPDATE "Appointments" SET patient_name=$1 WHERE patient_name=$2', [newName, oldName]);
       }
+      // Program / mandate changes, from a date (lib/patientPrograms.js).
+      let updated = updateRes.rows[0];
+      if (body.program_plan && (await patientPrograms.hasProgramsTable(client))) {
+        const cleaned = patientPrograms.cleanPlan(body.program_plan);
+        if (cleaned.error) {
+          await client.query('ROLLBACK');
+          return json(400, { error: cleaned.error });
+        }
+        await patientPrograms.applyPlan(client, id, cleaned.plan, currentUser.username);
+        updated = (await client.query('SELECT * FROM "Patients" WHERE id=$1', [id])).rows[0];
+      }
       const withAlerts = (await hasAlertColumns(db)) ? await saveAlertFields(client, id, body, existing) : null;
       await client.query('COMMIT');
-      return json(200, withAlerts || updateRes.rows[0]);
+      return json(200, withAlerts || updated);
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;

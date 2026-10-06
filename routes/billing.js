@@ -3,6 +3,7 @@ const { canManage, canAdminister } = require('../lib/roles');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
 const pastLock = require('../lib/pastLock');
 const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
+const patientPrograms = require('../lib/patientPrograms');
 const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 
 // Billing sheets (Oct 2026): one provider's month, laid out like the paper
@@ -85,7 +86,7 @@ async function buildSheet(db, provider, month) {
     : [];
   const names = [...new Set([...lockedNames, ...appts.map(a => a.patient_name)])];
   const patients = names.length
-    ? (await db.query('SELECT "Name", "Mandate", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows
+    ? (await db.query('SELECT id, "Name", "Mandate", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows
     : [];
   const patientByName = Object.fromEntries(patients.map(p => [p.Name, p]));
 
@@ -113,32 +114,47 @@ async function buildSheet(db, provider, month) {
   };
 
   const lockedSet = new Set(lockedNames);
-  const rows = names.map(name => {
-    const mine = appts.filter(a => a.patient_name === name);
-    const days = {};
-    let provided = 0;
-    let scheduled = 0;
-    for (const a of mine) {
-      const d = Number(String(a.appointment_date).slice(8, 10));
-      const mark = markFor(a);
-      if (mark === 'X' || mark === 'M') provided += 1;
-      // Sessions on a closed day (H or Z) still show, but aren't scheduled.
-      if (mark !== 'H' && mark !== 'Z') scheduled += 1;
-      (days[d] = days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
-    }
+  // Which program (and mandate) each session bills under: the patient's
+  // program history on the session's date, for this provider's discipline
+  // (lib/patientPrograms.js). A child whose program or mandate changed
+  // during the month gets a row for each. Before that migration, or for a
+  // patient with no history, their current Program / Mandate.
+  const services = String(providerRes.rows[0]?.specialty || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+  const history = await patientPrograms.historyFor(db, patients.map(p => p.id));
+  const billAs = (name, date) => {
     const p = patientByName[name] || {};
-    return {
-      patient_name: name,
-      mandate: p.Mandate || null,
-      program: p.Program || null,
-      group: groupFor(p.Program),
-      setting: mine.some(a => inOffice(a.treatment_area)) ? 'C' : '',
-      days,
-      scheduled,
-      total_sessions: provided,
-      locked: lockedSet.has(name),
-    };
-  }).sort((a, b) => a.patient_name.localeCompare(b.patient_name));
+    const hit = patientPrograms.programFor(history[p.id], date, services);
+    if (hit) return { program: hit.program, mandate: hit.mandate };
+    return { program: p.Program || null, mandate: p.Mandate || null };
+  };
+  const rowMap = new Map();
+  const rowFor = (name, program, mandate) => {
+    const key = `${name}\u0000${program || ''}\u0000${mandate || ''}`;
+    if (!rowMap.has(key)) {
+      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', days: {}, scheduled: 0, total_sessions: 0, locked: lockedSet.has(name) });
+    }
+    return rowMap.get(key);
+  };
+  for (const a of appts) {
+    const date = String(a.appointment_date).slice(0, 10);
+    const { program, mandate } = billAs(a.patient_name, date);
+    const row = rowFor(a.patient_name, program, mandate);
+    const d = Number(date.slice(8, 10));
+    const mark = markFor(a);
+    if (mark === 'X' || mark === 'M') row.total_sessions += 1;
+    // Sessions on a closed day (H or Z) still show, but aren't scheduled.
+    if (mark !== 'H' && mark !== 'Z') row.scheduled += 1;
+    if (inOffice(a.treatment_area)) row.setting = 'C';
+    (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
+  }
+  // Locked onto the sheet with no sessions left: their program at month end.
+  for (const name of names) {
+    if ([...rowMap.values()].some(r => r.patient_name === name)) continue;
+    const { program, mandate } = billAs(name, end);
+    rowFor(name, program, mandate);
+  }
+  const rows = [...rowMap.values()].sort((a, b) => a.patient_name.localeCompare(b.patient_name)
+    || (Object.keys(a.days)[0] || 99) - (Object.keys(b.days)[0] || 99));
 
   let reviewed = null;
   if (await hasTable(db, 'BillingReviews')) {
