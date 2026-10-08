@@ -29,25 +29,3 @@ CREATE TABLE IF NOT EXISTS "BillingReviews" (
   reviewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (provider, month)
 );
-
--- Changes to past appointments asked for by someone who isn't an Admin or
--- Developer. The original API call (method, path, body) is replayed as
--- the approver.
-CREATE TABLE IF NOT EXISTS "ScheduleChangeRequests" (
-  id BIGSERIAL PRIMARY KEY,
-  method TEXT NOT NULL,
-  path TEXT NOT NULL,
-  body JSONB NOT NULL DEFAULT '{}',
-  summary TEXT NOT NULL,
-  provider TEXT,
-  appointment_date DATE,
-  patient_name TEXT,
-  reason TEXT,
-  requested_by TEXT NOT NULL,
-  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'denied')),
-  reviewed_by TEXT,
-  reviewed_at TIMESTAMPTZ,
-  review_note TEXT
-);
-CREATE INDEX IF NOT EXISTS schedule_change_requests_status ON "ScheduleChangeRequests" (status, requested_at);

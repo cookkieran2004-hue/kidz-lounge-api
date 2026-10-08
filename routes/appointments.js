@@ -6,11 +6,10 @@ const pastLock = require('../lib/pastLock');
 
 async function handle(ctx) {
   const { path, method, qs, body, db, currentUser } = ctx;
-  // Past dates are locked for billing (lib/pastLock.js): status changes go
-  // through; anything else needs an Admin/Developer, or becomes a request.
+  // Changing a past appointment keeps the patient on that month's billing
+  // sheet (lib/pastLock.js). Never blocks the change.
   if (method !== 'GET' && (path.startsWith('/appointments') || path.startsWith('/recurring-series'))) {
-    const blocked = await pastLock.guard(ctx);
-    if (blocked) return blocked;
+    await pastLock.guard(ctx);
   }
 
   // Unrestricted, all-providers, date-range window -- used for the 4-week

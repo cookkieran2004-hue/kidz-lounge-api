@@ -19,9 +19,6 @@ const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 //   A      child absent (No Show, Canceled)
 //   M      make-up (Make Up, MUS)
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
-//
-// Also the change requests for past appointments (ScheduleChangeRequests):
-// listed for Admins/Developers to approve (replayed as them) or deny.
 
 const HOLD_PATIENT = 'hold - see comments';
 const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Other', 'Vacation', 'Sick', 'Personal']);
@@ -241,46 +238,6 @@ async function handle(ctx) {
       await db.query('DELETE FROM "BillingReviews" WHERE provider=$1 AND month=$2', [provider, `${month}-01`]);
     }
     return json(200, { ok: true });
-  }
-
-  // ---------- Change requests for past appointments ----------
-  if (path === '/schedule-change-requests' && method === 'GET') {
-    if (!(await hasTable(db, 'ScheduleChangeRequests'))) return json(200, []);
-    const status = ['pending', 'approved', 'denied'].includes(qs.status) ? qs.status : 'pending';
-    const params = [status];
-    let sql = `SELECT id, summary, provider, appointment_date, patient_name, reason, requested_by, requested_at, status, reviewed_by, reviewed_at, review_note
-               FROM "ScheduleChangeRequests" WHERE status=$1`;
-    if (!canAdminister(currentUser)) { params.push(currentUser.username); sql += ` AND requested_by=$${params.length}`; }
-    sql += status === 'pending' ? ' ORDER BY requested_at' : ' ORDER BY reviewed_at DESC LIMIT 100';
-    return json(200, (await db.query(sql, params)).rows);
-  }
-
-  const m = path.match(/^\/schedule-change-requests\/(\d+)\/(approve|deny)$/);
-  if (m && method === 'PUT') {
-    if (!canAdminister(currentUser)) return json(403, { error: 'Only an Admin or Developer can approve changes to past dates.' });
-    const reqRow = (await db.query('SELECT * FROM "ScheduleChangeRequests" WHERE id=$1', [m[1]])).rows[0];
-    if (!reqRow) return json(404, { error: 'Request not found.' });
-    if (reqRow.status !== 'pending') return json(409, { error: `This request was already ${reqRow.status}.` });
-    const note = String(body?.note || '').trim().slice(0, 500) || null;
-    if (m[2] === 'approve') {
-      // Keep the patient on the original sheet, then make the change as the
-      // approver.
-      await lockOnSheet(db, reqRow.provider, reqRow.appointment_date, reqRow.patient_name);
-      const appointmentRoutes = require('./appointments');
-      const result = await appointmentRoutes.handle({
-        path: reqRow.path, method: reqRow.method, qs: {}, body: reqRow.body || {}, db, currentUser, skipPastLock: true,
-      });
-      if (!result || result.statusCode >= 400) {
-        let msg = 'The change could not be made. The appointment may have been changed or removed since.';
-        try { msg = JSON.parse(result.body).error || msg; } catch { /* keep default */ }
-        return json(409, { error: msg });
-      }
-    }
-    await db.query(
-      `UPDATE "ScheduleChangeRequests" SET status=$1, reviewed_by=$2, reviewed_at=now(), review_note=$3 WHERE id=$4`,
-      [m[2] === 'approve' ? 'approved' : 'denied', currentUser.username, note, reqRow.id]
-    );
-    return json(200, { ok: true, status: m[2] === 'approve' ? 'approved' : 'denied' });
   }
 
   return null;
