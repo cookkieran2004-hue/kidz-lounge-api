@@ -26,6 +26,7 @@ async function hasTable(db, name) {
 //          UPTO, Unavailable, Other, Lunch, Meeting -- every type, Oct 2026)
 //   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
 //   A      child absent (No Show, Canceled)
+//   E      an evaluation (is_eval; migrations/2026-10-19_evals.sql)
 //   M      a make-up session (is_makeup; migrations/2026-10-17_makeups.sql)
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
 
@@ -83,9 +84,9 @@ async function buildSheet(db, provider, month) {
     db.query('SELECT "Name", specialty FROM "Providers" WHERE "Name"=$1', [provider]),
     db.query('SELECT phone FROM "Staff" WHERE provider_name=$1 AND archived = false LIMIT 1', [provider]),
   ]);
-  // A make-up that was itself canceled or no-showed drops off the sheet.
+  // A make-up or eval that was itself canceled or no-showed drops off the sheet.
   const appts = apptsAll.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
-    && !(a.is_makeup && (a.appointment_status === 'Canceled' || a.appointment_status === 'No Show')));
+    && !((a.is_makeup || a.is_eval) && (a.appointment_status === 'Canceled' || a.appointment_status === 'No Show')));
 
   // The provider's caseload for the month (lib/caseload.js): everyone with
   // an appointment that month (any status), and -- for the current month --
@@ -125,6 +126,7 @@ async function buildSheet(db, provider, month) {
     if (date >= today) return null; // the day hasn't ended yet
     if (providerAbsent(a)) return 'PA';
     if (a.is_makeup) return 'M';
+    if (a.is_eval) return 'E';
     return STATUS_MARK[a.appointment_status] || 'X';
   };
 
@@ -159,7 +161,7 @@ async function buildSheet(db, provider, month) {
     const row = rowFor(a.patient_name, program, mandate, code);
     const d = Number(date.slice(8, 10));
     const mark = markFor(a);
-    if (mark === 'X' || mark === 'M') row.total_sessions += 1;
+    if (mark === 'X' || mark === 'M' || mark === 'E') row.total_sessions += 1;
     // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
     // is a make-up -- the canceled session it replaces already was.
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;

@@ -3,6 +3,16 @@ const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
 
+// Positive-only cache, so booking works before the evals migration (the
+// appointment just isn't flagged).
+let evalColumnSeen = false;
+async function hasEvalColumn(db) {
+  if (evalColumnSeen) return true;
+  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Appointments' AND column_name = 'is_eval'`);
+  if (r.rows.length) evalColumnSeen = true;
+  return evalColumnSeen;
+}
+
 async function handle(ctx) {
   const { path, method, qs, body, db, currentUser } = ctx;
 
@@ -88,6 +98,12 @@ async function handle(ctx) {
     );
     if (makeupFor !== null) {
       const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
+      return json(201, marked.rows[0]);
+    }
+    // An eval (booked from the patient chart; migrations/2026-10-19_evals.sql).
+    if (body.is_eval === true) {
+      if (!(await hasEvalColumn(db))) return json(201, result.rows[0]);
+      const marked = await db.query('UPDATE "Appointments" SET is_eval=true WHERE id=$1 RETURNING *', [result.rows[0].id]);
       return json(201, marked.rows[0]);
     }
     return json(201, result.rows[0]);
