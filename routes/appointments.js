@@ -30,6 +30,26 @@ async function handle(ctx) {
     return json(200, merged);
   }
 
+  // The setting (Center / School / Home) last used with each offsite
+  // location, e.g. { "sunnyside elementary": "School" }, so picking a
+  // location fills its setting in (the frontend's offsite picker). Keys are
+  // lower-cased, trimmed locations; the most recently saved one wins.
+  if (path === '/appointments/offsite-settings' && method === 'GET') {
+    const res = await db.query(
+      `SELECT treatment_area, updated_at FROM (
+         SELECT treatment_area, updated_at FROM "Appointments" WHERE deleted = false AND treatment_area ~ '^Offsite \\((Center|School|Home)\\): '
+         UNION ALL
+         SELECT treatment_area, updated_at FROM "RecurringSeries" WHERE treatment_area ~ '^Offsite \\((Center|School|Home)\\): '
+       ) x ORDER BY updated_at ASC NULLS FIRST`
+    );
+    const out = {};
+    for (const r of res.rows) {
+      const m = String(r.treatment_area).match(/^Offsite \((Center|School|Home)\):\s*(.+)$/);
+      if (m) out[m[2].trim().replace(/\s+/g, ' ').toLowerCase()] = m[1];
+    }
+    return json(200, out);
+  }
+
   if (path === '/appointments/range' && method === 'GET') {
     let { provider, start, end } = qs;
     // Non-admins can only ever see their own linked provider's schedule,
