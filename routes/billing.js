@@ -48,8 +48,20 @@ function groupFor(program) {
   if (!parts.length || parts.every(p => OTHER_PROGRAMS.has(p))) return 'Other';
   return 'Insurance';
 }
-// An in-office room (not offsite, not unset).
-const inOffice = (area) => !!area && !/^offsite/i.test(String(area).trim());
+// A session's setting for the Setting column: an in-office room is C
+// (center); an offsite session is C, S or H from the setting picked with it
+// ("Offsite (School): ..." -- the frontend's makeOffsiteArea); no room, or
+// an older offsite session with no setting, is blank.
+const SETTING_LETTER = { Center: 'C', School: 'S', Home: 'H' };
+function settingOf(area) {
+  const a = String(area || '').trim();
+  if (!a) return '';
+  const m = a.match(/^Offsite(?: \((Center|School|Home)\))?(?::|$)/i);
+  if (!m) return 'C';
+  return m[1] ? SETTING_LETTER[m[1][0].toUpperCase() + m[1].slice(1).toLowerCase()] : '';
+}
+// Every setting used in a row, in C, S, H order: "C, S".
+const joinSettings = (set) => ['C', 'S', 'H'].filter(x => set.has(x)).join(', ');
 
 let closureTypeSeen = false;
 async function hasClosureType(db) {
@@ -134,7 +146,7 @@ async function buildSheet(db, provider, month) {
   const rowFor = (name, program, mandate) => {
     const key = `${name}\u0000${program || ''}\u0000${mandate || ''}`;
     if (!rowMap.has(key)) {
-      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', days: {}, scheduled: 0, total_sessions: 0 });
+      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
     }
     return rowMap.get(key);
   };
@@ -148,7 +160,8 @@ async function buildSheet(db, provider, month) {
     // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
     // is a make-up -- the canceled session it replaces already was.
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
-    if (inOffice(a.treatment_area)) row.setting = 'C';
+    const letter = settingOf(a.treatment_area);
+    if (letter) { row.settings.add(letter); row.setting = joinSettings(row.settings); }
     (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
   }
   // On the caseload with no sessions this month (booked later on): their program today.
@@ -157,6 +170,7 @@ async function buildSheet(db, provider, month) {
     const { program, mandate } = billAs(name, today);
     rowFor(name, program, mandate);
   }
+  for (const row of rowMap.values()) delete row.settings; // not sent
   const rows = [...rowMap.values()].sort((a, b) => a.patient_name.localeCompare(b.patient_name)
     || (Object.keys(a.days)[0] || 99) - (Object.keys(b.days)[0] || 99));
 
