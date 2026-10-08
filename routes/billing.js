@@ -22,13 +22,13 @@ async function hasTable(db, name) {
 // current month -- anyone booked with them later on.
 // A day's mark, once the day has ended:
 //   H / Z  the office was closed (closure_type holiday / emergency)
-//   PA     the provider had PTO/UPTO/Unavailable/Other (etc.) over the session
+//   PA     the provider had any out-of-office block over the session (PTO,
+//          UPTO, Unavailable, Other, Lunch, Meeting -- every type, Oct 2026)
 //   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
 //   A      child absent (No Show, Canceled)
 //   M      a make-up session (is_makeup; migrations/2026-10-17_makeups.sql)
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
 
-const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Other', 'Vacation', 'Sick', 'Personal']);
 const STATUS_MARK = {
   Scheduled: 'X', Confirmed: 'X', 'Left Message': 'X', Emailed: 'X',
   'No Show': 'A', Canceled: 'A',
@@ -107,7 +107,8 @@ async function buildSheet(db, provider, month) {
   closuresRes.rows.forEach(c => {
     closures[String(c.closure_date).slice(0, 10)] = { type: c.closure_type === 'emergency' ? 'emergency' : 'holiday', reason: c.reason || null };
   });
-  const absences = oooAll.filter(o => PROVIDER_ABSENT_TYPES.has(o.type));
+  // Every out-of-office type counts, meetings and lunch included.
+  const absences = oooAll;
   const providerAbsent = (a) => absences.some(o => {
     if (String(o.ooo_date).slice(0, 10) !== String(a.appointment_date).slice(0, 10)) return false;
     const s = mins(a.appointment_time);
