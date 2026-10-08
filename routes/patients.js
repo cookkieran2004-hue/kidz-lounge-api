@@ -4,7 +4,7 @@ const { currentCaseloads } = require('../lib/caseload');
 const { annotateMakeups } = require('../lib/recurring');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
-const { canCaseManage } = require('../lib/roles');
+const { canCaseManage, canAdminister } = require('../lib/roles');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -140,6 +140,28 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       [`%${q}%`]
     );
     return json(200, result.rows);
+  }
+
+  // Delete one program / mandate history entry to fix a mistake: Admin and
+  // Developer only. Deleting a current entry brings back the one it replaced
+  // (lib/patientPrograms.js deleteEntry).
+  const delMatch = path.match(/^\/patients\/([^/]+)\/programs\/(\d+)$/);
+  if (delMatch && method === 'DELETE') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Only an Admin or Developer can delete a program or mandate entry.' });
+    if (!(await patientPrograms.hasProgramsTable(db))) return json(404, { error: 'Program history is not set up yet.' });
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const ok = await patientPrograms.deleteEntry(client, delMatch[1], delMatch[2]);
+      if (!ok) { await client.query('ROLLBACK'); return json(404, { error: 'That entry was not found. It may already have been deleted.' }); }
+      await client.query('COMMIT');
+      return json(200, { deleted: true });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // A patient's program history (current and past), for the patient form and chart.
