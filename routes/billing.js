@@ -1,17 +1,25 @@
 const { json } = require('../lib/http');
 const { canManage, canAdminister } = require('../lib/roles');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
-const pastLock = require('../lib/pastLock');
+const { clinicToday, isHold, currentCaseloads } = require('../lib/caseload');
 const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
 const patientPrograms = require('../lib/patientPrograms');
-const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
+// Positive-only cache, so the code works before a migration has run.
+const tableSeen = new Set();
+async function hasTable(db, name) {
+  if (tableSeen.has(name)) return true;
+  const r = await db.query('SELECT to_regclass($1) AS t', [`"${name}"`]);
+  if (r.rows[0]?.t) { tableSeen.add(name); return true; }
+  return false;
+}
 
 // Billing sheets (Oct 2026): one provider's month, laid out like the paper
 // invoice. Same access as the weekly view: staff see their own linked
 // provider, reception/admin/developer any provider.
 //
-// A row per patient seen that month (appointments in the month, plus any
-// patient locked onto the sheet by a day that has ended -- lib/pastLock.js).
+// A row per patient on the provider's caseload that month (lib/caseload.js):
+// anyone with an appointment in the month, any status, plus -- for the
+// current month -- anyone booked with them later on.
 // A day's mark, once the day has ended:
 //   H / Z  the office was closed (closure_type holiday / emergency)
 //   PA     the provider had PTO/UPTO/Unavailable/Other (etc.) over the session
@@ -20,7 +28,6 @@ const { clinicToday, monthOf, hasTable, lockOnSheet } = pastLock;
 //   M      make-up (Make Up, MUS)
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
 
-const HOLD_PATIENT = 'hold - see comments';
 const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Other', 'Vacation', 'Sick', 'Personal']);
 const STATUS_MARK = {
   Scheduled: 'X', Confirmed: 'X', 'Left Message': 'X', Emailed: 'X',
@@ -66,22 +73,19 @@ async function buildSheet(db, provider, month) {
     db.query('SELECT "Name", specialty FROM "Providers" WHERE "Name"=$1', [provider]),
     db.query('SELECT phone FROM "Staff" WHERE provider_name=$1 AND archived = false LIMIT 1', [provider]),
   ]);
-  const appts = apptsAll.filter(a => a.appointment_status !== '*HOLD*' && String(a.patient_name || '').trim().toLowerCase() !== HOLD_PATIENT);
+  const appts = apptsAll.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name));
 
-  // Lock every patient seen on a day that has ended.
-  if (await hasTable(db, 'BillingCaseload')) {
-    const past = [...new Set(appts.filter(a => String(a.appointment_date).slice(0, 10) < today).map(a => a.patient_name))];
-    if (past.length) {
-      await db.query(
-        `INSERT INTO "BillingCaseload" (provider, month, patient_name) SELECT $1, $2, unnest($3::text[]) ON CONFLICT DO NOTHING`,
-        [provider, start, past]
-      );
+  // The provider's caseload for the month (lib/caseload.js): everyone with
+  // an appointment that month (any status), and -- for the current month --
+  // anyone booked with them later on, who shows with no sessions yet. It
+  // follows the schedule: a patient whose only appointment is moved to
+  // another provider or deleted drops off.
+  const names = [...new Set(appts.map(a => a.patient_name))];
+  if (today >= start && today <= end) {
+    for (const [name, providers] of await currentCaseloads(db, { today, provider })) {
+      if (providers.has(provider) && !names.includes(name)) names.push(name);
     }
   }
-  const lockedNames = (await hasTable(db, 'BillingCaseload'))
-    ? (await db.query('SELECT patient_name FROM "BillingCaseload" WHERE provider=$1 AND month=$2', [provider, start])).rows.map(r => r.patient_name)
-    : [];
-  const names = [...new Set([...lockedNames, ...appts.map(a => a.patient_name)])];
   const patients = names.length
     ? (await db.query('SELECT id, "Name", "Mandate", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows
     : [];
@@ -110,7 +114,6 @@ async function buildSheet(db, provider, month) {
     return STATUS_MARK[a.appointment_status] || 'X';
   };
 
-  const lockedSet = new Set(lockedNames);
   // Which program (and mandate) each session bills under: the patient's
   // program history on the session's date, for this provider's discipline
   // (lib/patientPrograms.js). A child whose program or mandate changed
@@ -128,7 +131,7 @@ async function buildSheet(db, provider, month) {
   const rowFor = (name, program, mandate) => {
     const key = `${name}\u0000${program || ''}\u0000${mandate || ''}`;
     if (!rowMap.has(key)) {
-      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', days: {}, scheduled: 0, total_sessions: 0, locked: lockedSet.has(name) });
+      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', days: {}, scheduled: 0, total_sessions: 0 });
     }
     return rowMap.get(key);
   };
@@ -144,10 +147,10 @@ async function buildSheet(db, provider, month) {
     if (inOffice(a.treatment_area)) row.setting = 'C';
     (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
   }
-  // Locked onto the sheet with no sessions left: their program at month end.
+  // On the caseload with no sessions this month (booked later on): their program today.
   for (const name of names) {
     if ([...rowMap.values()].some(r => r.patient_name === name)) continue;
-    const { program, mandate } = billAs(name, end);
+    const { program, mandate } = billAs(name, today);
     rowFor(name, program, mandate);
   }
   const rows = [...rowMap.values()].sort((a, b) => a.patient_name.localeCompare(b.patient_name)
@@ -222,6 +225,35 @@ async function handle(ctx) {
     return json(200, await buildSheet(db, provider, month));
   }
 
+  // A provider's caseload right now (staff profile > Caseload): each patient
+  // with their program and next appointment with this provider. Staff see
+  // their own; reception, admin and developer anyone's.
+  const cm = path.match(/^\/providers\/([^/]+)\/caseload$/);
+  if (cm && method === 'GET') {
+    const provider = decodeURIComponent(cm[1]);
+    if (!canManage(currentUser) && currentUser.providerName !== provider) return json(403, { error: 'You can only see your own caseload.' });
+    const today = clinicToday();
+    const names = [...(await currentCaseloads(db, { today, provider })).keys()];
+    if (!names.length) return json(200, []);
+    const horizon = addDays(today, 365);
+    const [patientsRes, upcoming] = await Promise.all([
+      db.query('SELECT "Name", "Program", "Status" FROM "Patients" WHERE "Name" = ANY($1)', [names]),
+      getMergedAppointments(db, { startDate: today, endDate: horizon, provider }),
+    ]);
+    const info = Object.fromEntries(patientsRes.rows.map(p => [p.Name, p]));
+    const next = {};
+    for (const a of upcoming) {
+      if (a.appointment_status === 'Canceled' || next[a.patient_name]) continue;
+      next[a.patient_name] = { date: String(a.appointment_date).slice(0, 10), time: String(a.appointment_time).slice(0, 5) };
+    }
+    return json(200, names.sort((a, b) => a.localeCompare(b)).map(name => ({
+      patient_name: name,
+      program: info[name]?.Program || null,
+      status: info[name]?.Status || null,
+      next_appointment: next[name] || null,
+    })));
+  }
+
   // The REVIEWED box: Admin and Developer.
   if (path === '/billing/review' && method === 'PUT') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Only an Admin or Developer can mark a sheet reviewed.' });
@@ -243,4 +275,4 @@ async function handle(ctx) {
   return null;
 }
 
-module.exports = { handle, groupFor, buildSheet, monthOf };
+module.exports = { handle, groupFor, buildSheet };

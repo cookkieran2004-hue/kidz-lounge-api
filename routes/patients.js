@@ -1,9 +1,9 @@
 const { json } = require('../lib/http');
 const patientPrograms = require('../lib/patientPrograms');
+const { currentCaseloads } = require('../lib/caseload');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
 const { canCaseManage } = require('../lib/roles');
-const { todayStr } = require('../lib/workSchedule');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -61,28 +61,10 @@ async function resolveCaseManagerFields(db, caseManagerUsername, caseManagerText
 async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/patients' && method === 'GET') {
     const result = await db.query('SELECT * FROM "Patients" ORDER BY "Name"');
-    // Each patient's care team: providers with an upcoming, non-canceled
-    // appointment -- the chart's Care Team "Current Providers" -- so the
-    // patient list and data table can show and filter by it. Weekly series
-    // count while they're still running (they aren't stored as single rows).
-    const today = todayStr();
-    const [single, series] = await Promise.all([
-      db.query(
-        `SELECT DISTINCT patient_name, provider FROM "Appointments"
-         WHERE appointment_date >= $1 AND deleted = false AND appointment_status IS DISTINCT FROM 'Canceled' AND provider IS NOT NULL`,
-        [today]
-      ),
-      db.query(
-        `SELECT DISTINCT patient_name, provider FROM "RecurringSeries"
-         WHERE (end_date IS NULL OR end_date >= $1) AND appointment_status IS DISTINCT FROM 'Canceled' AND provider IS NOT NULL`,
-        [today]
-      ),
-    ]);
-    const team = new Map();
-    for (const r of [...single.rows, ...series.rows]) {
-      if (!team.has(r.patient_name)) team.set(r.patient_name, new Set());
-      team.get(r.patient_name).add(r.provider);
-    }
+    // Each patient's care team: the providers whose caseload they're on
+    // (lib/caseload.js) -- the chart's Care Team "Current Providers" -- so
+    // the patient list and data table can show and filter by it.
+    const team = await currentCaseloads(db);
     return json(200, result.rows.map(p => ({ ...p, care_team: [...(team.get(p.Name) || [])].sort() })));
   }
 
@@ -184,7 +166,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path.match(/^\/patients\/[^/]+$/) && method === 'GET') {
     const name = decodeURIComponent(path.split('/').pop());
     const result = await db.query('SELECT * FROM "Patients" WHERE "Name" = $1 LIMIT 1', [name]);
-    return json(200, result.rows[0] || null);
+    if (!result.rows[0]) return json(200, null);
+    // Current providers: whose caseload they're on (lib/caseload.js).
+    const team = (await currentCaseloads(db, { patientName: name })).get(name) || new Set();
+    return json(200, { ...result.rows[0], care_team: [...team].sort() });
   }
 
   if (path.match(/^\/patients\/[^/]+$/) && method === 'PUT') {

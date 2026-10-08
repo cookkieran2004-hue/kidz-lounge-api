@@ -10,17 +10,6 @@ DO $$ BEGIN
   END IF;
 END $$;
 
--- A patient seen by a provider on a day that has ended stays on that
--- provider's sheet for the month, even if the appointment is later moved
--- or deleted.
-CREATE TABLE IF NOT EXISTS "BillingCaseload" (
-  provider TEXT NOT NULL,          -- "Providers"."Name"
-  month DATE NOT NULL,             -- first of the month
-  patient_name TEXT NOT NULL,      -- "Patients"."Name"
-  locked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (provider, month, patient_name)
-);
-
 -- The sheet's REVIEWED box.
 CREATE TABLE IF NOT EXISTS "BillingReviews" (
   provider TEXT NOT NULL,
