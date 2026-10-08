@@ -15,6 +15,17 @@ const { HttpError, syncLinkedProvider, assertProviderNotLinkedElsewhere } = requ
 const { verifyAdminPassword } = require('../lib/auth');
 const { displayNameFor } = require('../lib/utils');
 
+// A US 10-digit phone number (a leading country code 1 is allowed), stored
+// as (555) 555-5555 -- never free text. Empty -> null; anything else that
+// isn't 10 digits -> undefined (refuse it).
+function normalizePhone(value) {
+  if (!value) return null;
+  let digits = String(value).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) digits = digits.slice(1);
+  if (digits.length !== 10) return undefined;
+  return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+}
+
 async function handle({ path, method, qs, body, db, currentUser }) {
   // Lightweight, non-admin-gated staff list -- any staff member can edit a
   // patient's Case Manager, so the dropdown that populates it needs to be
@@ -54,15 +65,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path === '/staff/me' && method === 'PUT') {
     const { email, preferred_name } = body;
-    // Phone is a US 10-digit number (a leading country code 1 is allowed),
-    // stored as (555) 555-5555 -- never free text.
-    let phone = null;
-    if (body.phone) {
-      let digits = String(body.phone).replace(/\D/g, '');
-      if (digits.length === 11 && digits.startsWith('1')) digits = digits.slice(1);
-      if (digits.length !== 10) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
-      phone = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
-    }
+    const phone = normalizePhone(body.phone);
+    if (phone === undefined) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
     const result = await db.query(
       `UPDATE "Staff" SET phone=$1, email=$2, preferred_name=$3 WHERE username=$4
        RETURNING username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date`,
@@ -71,21 +75,27 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, result.rows[0]);
   }
 
+  // Your own credentials -- or, for an Admin / Developer, anyone's
+  // (?username= / body.username, from their staff profile).
   if (path === '/staff/credentials' && method === 'GET') {
+    const who = qs.username && qs.username !== currentUser.username ? qs.username : currentUser.username;
+    if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT * FROM "StaffCredentials" WHERE username=$1 ORDER BY expiration_date ASC`,
-      [currentUser.username]
+      [who]
     );
     return json(200, result.rows);
   }
 
   if (path === '/staff/credentials' && method === 'POST') {
     const { credential_name, expiration_date, notes } = body;
+    const who = body.username && body.username !== currentUser.username ? body.username : currentUser.username;
+    if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     if (!credential_name || !credential_name.trim()) return json(400, { error: 'Credential name is required.' });
     if (!expiration_date) return json(400, { error: 'Expiration date is required.' });
     const result = await db.query(
       `INSERT INTO "StaffCredentials" (username, credential_name, expiration_date, notes) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [currentUser.username, credential_name.trim(), expiration_date, notes || null]
+      [who, credential_name.trim(), expiration_date, notes || null]
     );
     return json(201, result.rows[0]);
   }
@@ -125,7 +135,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!canManage(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT id, username, role, provider_name, must_reset_password, created_at, last_login,
-              first_name, middle_name, last_name, preferred_name, position, archived, hire_date${(await hasEmploymentColumn(db)) ? ', employment_type' : ''}
+              first_name, middle_name, last_name, preferred_name, position, archived, hire_date, phone, email${(await hasEmploymentColumn(db)) ? ', employment_type' : ''}
        FROM "Staff" ORDER BY archived, username`
     );
     return json(200, result.rows);
@@ -193,6 +203,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const id = path.split('/').pop();
     const { role, reset_temporary_password, provider_name, admin_password, first_name, middle_name, last_name, preferred_name, position, archived, hire_date } = body;
+    // Phone and email (from the staff profile's Account and role), only when sent.
+    const hasPhone = Object.prototype.hasOwnProperty.call(body, 'phone');
+    const hasEmail = Object.prototype.hasOwnProperty.call(body, 'email');
+    const phoneValue = hasPhone ? normalizePhone(body.phone) : null;
+    if (hasPhone && phoneValue === undefined) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
     if (role !== undefined && role !== null && role !== '' && !ROLES.includes(role)) {
       return json(400, { error: `Role must be one of: ${ROLES.join(', ')}.` });
     }
@@ -245,6 +260,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     );
     const updated = result.rows[0];
     if (!updated) { await client.query('ROLLBACK'); return json(404, { error: 'Staff account not found.' }); }
+    if (hasPhone || hasEmail) {
+      const contact = await client.query(
+        `UPDATE "Staff" SET phone = CASE WHEN $1 THEN $2 ELSE phone END, email = CASE WHEN $3 THEN $4 ELSE email END
+         WHERE id = $5 RETURNING phone, email`,
+        [hasPhone, phoneValue, hasEmail, String(body.email || '').trim() || null, updated.id]
+      );
+      Object.assign(updated, contact.rows[0]);
+    }
     const savedType = await saveEmploymentType(client, updated.id, body);
     if (savedType) updated.employment_type = savedType;
     // Admins and developers may change anyone's role, their own included,
