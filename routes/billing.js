@@ -38,15 +38,13 @@ const DISCIPLINE = { ST: 'Speech Therapy', OT: 'Occupational Therapy', PT: 'Phys
 const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
 const pad = (n) => String(n).padStart(2, '0');
 
-// Programs on the Other section (P and PP included -- not insurance).
-const OTHER_PROGRAMS = new Set(['P', 'PP', 'NONE', 'PRIVATE', 'SELF PAY', 'OTHER']);
-// EI, DOE (CPSE/CSE), Insurance, or Other.
+// EI, DOE (CPSE/CSE), or Other (insurance, P, PP, none).
 function groupFor(program) {
   const parts = String(program || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
   if (parts.includes('EI')) return 'EI';
   if (parts.some(p => p === 'CPSE' || p === 'CSE' || p === 'DOE')) return 'DOE';
-  if (!parts.length || parts.every(p => OTHER_PROGRAMS.has(p))) return 'Other';
-  return 'Insurance';
+  // Insurance and Other are one section, "Other" (Oct 2026).
+  return 'Other';
 }
 // A session's setting for the Setting column: an in-office room is C
 // (center); an offsite session is C, S or H from the setting picked with it
@@ -139,21 +137,25 @@ async function buildSheet(db, provider, month) {
   const billAs = (name, date) => {
     const p = patientByName[name] || {};
     const hit = patientPrograms.programFor(history[p.id], date, services);
-    if (hit) return { program: hit.program, mandate: hit.mandate };
-    return { program: p.Program || null, mandate: p.Mandate || null };
+    if (hit) return { program: hit.program, mandate: hit.mandate, code: hit.billing_code };
+    return { program: p.Program || null, mandate: p.Mandate || null, code: null };
   };
   const rowMap = new Map();
-  const rowFor = (name, program, mandate) => {
-    const key = `${name}\u0000${program || ''}\u0000${mandate || ''}`;
+  // An insurance / P / PP program shows as its billing code (C-1 ... C-#);
+  // with none entered yet, its name plus needs_code (a red # on the sheet).
+  const rowFor = (name, program, mandate, code = null) => {
+    const coded = program && String(program).split(',').some(x => patientPrograms.takesBillingCode(x.trim()));
+    const shown = coded && code ? code : program;
+    const key = `${name}\u0000${shown || ''}\u0000${mandate || ''}`;
     if (!rowMap.has(key)) {
-      rowMap.set(key, { patient_name: name, mandate, program, group: groupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
+      rowMap.set(key, { patient_name: name, mandate, program: shown, needs_code: !!(coded && !code), group: groupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
     }
     return rowMap.get(key);
   };
   for (const a of appts) {
     const date = String(a.appointment_date).slice(0, 10);
-    const { program, mandate } = billAs(a.patient_name, date);
-    const row = rowFor(a.patient_name, program, mandate);
+    const { program, mandate, code } = billAs(a.patient_name, date);
+    const row = rowFor(a.patient_name, program, mandate, code);
     const d = Number(date.slice(8, 10));
     const mark = markFor(a);
     if (mark === 'X' || mark === 'M') row.total_sessions += 1;
@@ -167,8 +169,8 @@ async function buildSheet(db, provider, month) {
   // On the caseload with no sessions this month (booked later on): their program today.
   for (const name of names) {
     if ([...rowMap.values()].some(r => r.patient_name === name)) continue;
-    const { program, mandate } = billAs(name, today);
-    rowFor(name, program, mandate);
+    const { program, mandate, code } = billAs(name, today);
+    rowFor(name, program, mandate, code);
   }
   for (const row of rowMap.values()) delete row.settings; // not sent
   const rows = [...rowMap.values()].sort((a, b) => a.patient_name.localeCompare(b.patient_name)

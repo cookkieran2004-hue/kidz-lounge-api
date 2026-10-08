@@ -170,7 +170,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!(await patientPrograms.hasProgramsTable(db))) return json(200, { available: false, rows: [] });
     if (id === 'new') return json(200, { available: true, rows: [] }); // a patient not saved yet
     const rows = (await db.query(
-      `SELECT id, program, service, sessions, minutes, start_date, end_date, created_by, created_at, ended_by, legacy_mandate
+      `SELECT *
        FROM "PatientPrograms" WHERE patient_id=$1 ORDER BY end_date IS NOT NULL, start_date DESC NULLS LAST, program, service`,
       [id]
     )).rows;
