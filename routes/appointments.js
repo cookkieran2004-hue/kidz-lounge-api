@@ -1,7 +1,7 @@
 const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
-const { getMergedAppointments } = require('../lib/recurring');
+const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
 
 async function handle(ctx) {
   const { path, method, qs, body, db, currentUser } = ctx;
@@ -66,12 +66,30 @@ async function handle(ctx) {
 
   if (path === '/appointments' && method === 'POST') {
     const { patient_name, provider, appointment_date, appointment_time, duration, treatment_area, appointment_status, fin } = body;
+    // A make-up for a Canceled / No Show appointment (migrations/2026-10-17_makeups.sql).
+    let makeupFor = null;
+    if (body.makeup_for !== undefined && body.makeup_for !== null && body.makeup_for !== '') {
+      if (!(await hasMakeupColumn(db))) return json(409, { error: 'Make-ups need the 2026-10-17 migration. Ask an admin to run it.' });
+      const orig = (await db.query('SELECT * FROM "Appointments" WHERE id=$1 AND deleted = false', [body.makeup_for])).rows[0];
+      if (!orig) return json(404, { error: 'The canceled appointment this makes up for was not found. It may have been deleted.' });
+      if (!MISSED_STATUSES.includes(orig.appointment_status)) return json(400, { error: 'Only a canceled or no-show appointment can get a make-up.' });
+      const already = (await db.query(
+        `SELECT 1 FROM "Appointments" WHERE makeup_for=$1 AND deleted = false AND appointment_status <> ALL($2) LIMIT 1`,
+        [orig.id, MISSED_STATUSES]
+      )).rows[0];
+      if (already) return json(409, { error: 'That appointment already has a make-up scheduled.' });
+      makeupFor = orig.id;
+    }
     const result = await db.query(
       `INSERT INTO "Appointments"
         (patient_name, provider, appointment_date, appointment_time, duration, treatment_area, appointment_status, fin, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now()) RETURNING *`,
       [patient_name, provider, appointment_date, appointment_time, duration || 30, treatment_area || null, appointment_status || 'Scheduled', fin || null]
     );
+    if (makeupFor !== null) {
+      const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
+      return json(201, marked.rows[0]);
+    }
     return json(201, result.rows[0]);
   }
 

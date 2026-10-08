@@ -25,14 +25,14 @@ async function hasTable(db, name) {
 //   PA     the provider had PTO/UPTO/Unavailable/Other (etc.) over the session
 //   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
 //   A      child absent (No Show, Canceled)
-//   M      make-up (Make Up, MUS)
+//   M      a make-up session (is_makeup; migrations/2026-10-17_makeups.sql)
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
 
 const PROVIDER_ABSENT_TYPES = new Set(['PTO', 'UPTO', 'Unavailable', 'Other', 'Vacation', 'Sick', 'Personal']);
 const STATUS_MARK = {
   Scheduled: 'X', Confirmed: 'X', 'Left Message': 'X', Emailed: 'X',
   'No Show': 'A', Canceled: 'A',
-  'Make Up': 'M', MUS: 'M',
+  'Make Up': 'M', MUS: 'M', // retired statuses, in case any are left
 };
 const DISCIPLINE = { ST: 'Speech Therapy', OT: 'Occupational Therapy', PT: 'Physical Therapy', SI: 'Special Instruction' };
 const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
@@ -73,7 +73,9 @@ async function buildSheet(db, provider, month) {
     db.query('SELECT "Name", specialty FROM "Providers" WHERE "Name"=$1', [provider]),
     db.query('SELECT phone FROM "Staff" WHERE provider_name=$1 AND archived = false LIMIT 1', [provider]),
   ]);
-  const appts = apptsAll.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name));
+  // A make-up that was itself canceled or no-showed drops off the sheet.
+  const appts = apptsAll.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
+    && !(a.is_makeup && (a.appointment_status === 'Canceled' || a.appointment_status === 'No Show')));
 
   // The provider's caseload for the month (lib/caseload.js): everyone with
   // an appointment that month (any status), and -- for the current month --
@@ -111,6 +113,7 @@ async function buildSheet(db, provider, month) {
     if (closures[date]) return closures[date].type === 'emergency' ? 'Z' : 'H';
     if (date >= today) return null; // the day hasn't ended yet
     if (providerAbsent(a)) return 'PA';
+    if (a.is_makeup) return 'M';
     return STATUS_MARK[a.appointment_status] || 'X';
   };
 
@@ -142,8 +145,9 @@ async function buildSheet(db, provider, month) {
     const d = Number(date.slice(8, 10));
     const mark = markFor(a);
     if (mark === 'X' || mark === 'M') row.total_sessions += 1;
-    // Sessions on a closed day (H or Z) still show, but aren't scheduled.
-    if (mark !== 'H' && mark !== 'Z') row.scheduled += 1;
+    // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
+    // is a make-up -- the canceled session it replaces already was.
+    if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
     if (inOffice(a.treatment_area)) row.setting = 'C';
     (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
   }

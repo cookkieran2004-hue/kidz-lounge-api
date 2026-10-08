@@ -1,6 +1,7 @@
 const { json } = require('../lib/http');
 const patientPrograms = require('../lib/patientPrograms');
 const { currentCaseloads } = require('../lib/caseload');
+const { annotateMakeups } = require('../lib/recurring');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
 const { canCaseManage } = require('../lib/roles');
@@ -163,7 +164,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       'SELECT * FROM "Appointments" WHERE patient_name = $1 AND deleted = false ORDER BY appointment_date DESC, appointment_time DESC',
       [name]
     );
-    return json(200, result.rows);
+    return json(200, await annotateMakeups(db, result.rows));
   }
 
   if (path.match(/^\/patients\/[^/]+$/) && method === 'GET') {
