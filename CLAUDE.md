@@ -147,4 +147,4 @@ Show the results before shipping.
 
 - `migrations/2026-10-17_makeups.sql`: `Appointments.makeup_for` (the Canceled / No Show appointment a make-up replaces) and `is_makeup`. The old `Make Up` / `MUS` statuses are retired: the migration turns them into Scheduled + `is_makeup` (no link), and any series with them into Scheduled.
 - `POST /appointments` with `makeup_for`: the original must exist, be Canceled or No Show, and not already have a live make-up (one that isn't itself Canceled / No Show / deleted). Make-ups are one-time appointments only.
-- `annotateMakeups` (`lib/recurring.js`, run by `getMergedAppointments` and the patient chart's appointment list) gives each canceled / no-show row its live make-up as `makeup: { id, appointment_date, appointment_time, provider }`. The frontend shows a green * on it and a green MU on the make-up.
+- `annotateMakeups` (`lib/recurring.js`, run by `getMergedAppointments` and the patient chart's appointment list) gives each canceled / no-show row its live make-up as `makeup: { id, appointment_date, appointment_time, provider }`. The frontend shows a green MUS tag on it and a green MU on the make-up.
