@@ -157,7 +157,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path.match(/^\/patients\/[^/]+\/appointments$/) && method === 'GET') {
     const name = decodeURIComponent(path.split('/')[2]);
     const result = await db.query(
-      'SELECT * FROM "Appointments" WHERE patient_name = $1 ORDER BY appointment_date DESC, appointment_time DESC',
+      // deleted = false: a deleted occurrence of a weekly series is kept as a
+      // row marked deleted (it stops the series regenerating that date). It
+      // was listed on the chart, so deleting it there seemed to do nothing.
+      'SELECT * FROM "Appointments" WHERE patient_name = $1 AND deleted = false ORDER BY appointment_date DESC, appointment_time DESC',
       [name]
     );
     return json(200, result.rows);
