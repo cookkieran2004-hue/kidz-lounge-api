@@ -271,6 +271,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
           await client.query('ROLLBACK');
           return json(400, { error: cleaned.error });
         }
+        // No date = replace for all dates. Only allowed for the first change,
+        // while the patient still has just the old mandate; after that a
+        // change must start on a date so billing history is kept.
+        if (!cleaned.plan.effective_from && !(await patientPrograms.onlyOldMandates(client, id))) {
+          await client.query('ROLLBACK');
+          return json(400, { error: 'Choose the date the program changes start. Only the first change can replace the old mandate for all dates.' });
+        }
         await patientPrograms.applyPlan(client, id, cleaned.plan, currentUser.username);
         updated = (await client.query('SELECT * FROM "Patients" WHERE id=$1', [id])).rows[0];
       }
