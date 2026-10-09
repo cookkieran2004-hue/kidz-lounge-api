@@ -9,7 +9,7 @@ const { getPool } = require('../lib/db');
 // the rest of the app doesn't keep -- the agency (billing provider and
 // submitter), each provider as EI-Hub knows them plus their default codes,
 // and each EI child's sex, address, county, diagnoses and, per service
-// authorization, the referring provider. Developers only for now, like the
+// authorization, the referring provider. Admins and Developers, like the
 // EI-Hub entry list (routes/billing.js). migrations/2026-10-21_ei_billing_setup.sql.
 //
 //   GET  /ei-hub/setup                    agency + providers + the code / county lists
@@ -24,7 +24,7 @@ const { getPool } = require('../lib/db');
 //   GET  /ei-hub/claim-files/:id            download a file again
 
 const MIGRATION = 'This needs the 2026-10-20 and 2026-10-21 database updates. Ask an admin to run them.';
-const DENIED = 'EI-Hub billing is only open to Developers for now.';
+const DENIED = 'EI-Hub billing is only open to Admins and Developers.';
 let ready = false;
 async function hasSetup(db) {
   if (ready) return true;
