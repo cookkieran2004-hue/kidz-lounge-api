@@ -36,6 +36,11 @@ const STATUS_MARK = {
   'Make Up': 'M', MUS: 'M', // retired statuses, in case any are left
 };
 const DISCIPLINE = { ST: 'Speech Therapy', OT: 'Occupational Therapy', PT: 'Physical Therapy', SI: 'Special Instruction' };
+// A provider's disciplines from Providers.specialty, saved as "ST/OT" by the
+// specialty picker (older rows may use commas): ['ST', 'OT']. Splitting on
+// commas alone read "ST/OT" as one unknown service, so a two-discipline
+// provider's sessions billed under whichever program came first.
+const disciplinesOf = (specialty) => String(specialty || '').split(/[,/]/).map(x => x.trim().toUpperCase()).filter(Boolean);
 const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -135,7 +140,7 @@ async function buildSheet(db, provider, month) {
   // (lib/patientPrograms.js). A child whose program or mandate changed
   // during the month gets a row for each. Before that migration, or for a
   // patient with no history, their current Program / Mandate.
-  const services = String(providerRes.rows[0]?.specialty || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+  const services = disciplinesOf(providerRes.rows[0]?.specialty);
   const history = await patientPrograms.historyFor(db, patients.map(p => p.id));
   const billAs = (name, date) => {
     const p = patientByName[name] || {};
@@ -192,7 +197,7 @@ async function buildSheet(db, provider, month) {
     end,
     today,
     days_in_month: daysInMonth,
-    discipline: spec.split(',').map(s => DISCIPLINE[s.trim()] || s.trim()).filter(Boolean).join(', '),
+    discipline: disciplinesOf(spec).map(s => DISCIPLINE[s] || s).join(', '),
     phone: staffRes.rows[0]?.phone || null,
     closures,
     rows,
@@ -241,7 +246,7 @@ async function eiHubSessions(db, month) {
     db.query('SELECT "Name", specialty FROM "Providers"'),
   ]);
   const closed = new Set(closuresRes.rows.map(c => day10(c.closure_date)));
-  const specialty = Object.fromEntries(providersRes.rows.map(p => [p.Name, String(p.specialty || '').split(/[,/]/).map(x => x.trim().toUpperCase()).filter(Boolean)]));
+  const specialty = Object.fromEntries(providersRes.rows.map(p => [p.Name, disciplinesOf(p.specialty)]));
   const providerOut = (a) => ooo.some(o => o.provider === a.provider && day10(o.ooo_date) === day10(a.appointment_date)
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   const appts = apptsAll.filter(a => {
