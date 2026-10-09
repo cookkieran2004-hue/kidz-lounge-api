@@ -201,6 +201,127 @@ async function buildSheet(db, provider, month) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// EI-Hub entry (Oct 2026). EI sessions are typed into the state's EI-Hub by
+// hand (Reception), one by one. This lists every EI session that took place
+// in a month -- the same ones the billing sheets mark X, M or E -- with what
+// EI-Hub asks for, and tracks which have been entered ("EiHubEntries",
+// migrations/2026-10-20_ei_hub.sql). An 837P claim file for EI-Hub's file
+// loader can be built from the same list once the state's companion guide
+// is in hand.
+//
+// A session is EI when the program it bills under on its date (the
+// patient's program history, for the provider's discipline -- the same
+// rule as the billing sheet) is EI. Skipped: days not over yet, office
+// closures, sessions while the provider was out (PA), Canceled / No Show,
+// *HOLD* and the HOLD placeholder.
+
+const SETTING_NAME = { C: 'Center', S: 'School', H: 'Home' };
+const day10 = (v) => String(v).slice(0, 10);
+const toTime = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+
+// Stays the same when a weekly-series date is edited into its own row, so
+// a tick isn't lost (or doubled) by that.
+function sessionKey(a) {
+  if (a.is_virtual) return `series:${a.series_id}:${day10(a.appointment_date)}`;
+  if (a.exception_of_series_id) return `series:${a.exception_of_series_id}:${day10(a.exception_occurrence_date)}`;
+  return `appt:${a.id}`;
+}
+const SESSION_KEY_RE = /^(appt:[\w-]+|series:[\w-]+:\d{4}-\d{2}-\d{2})$/;
+
+async function eiHubSessions(db, month) {
+  const start = `${month}-01`;
+  const [y, m] = month.split('-').map(Number);
+  const end = `${month}-${pad(new Date(y, m, 0).getDate())}`;
+  const today = clinicToday();
+  const [apptsAll, ooo, closuresRes, providersRes] = await Promise.all([
+    getMergedAppointments(db, { startDate: start, endDate: end }),
+    getMergedOOO(db, { startDate: start, endDate: end }),
+    db.query('SELECT closure_date FROM "OfficeClosures" WHERE closure_date BETWEEN $1 AND $2', [start, end]),
+    db.query('SELECT "Name", specialty FROM "Providers"'),
+  ]);
+  const closed = new Set(closuresRes.rows.map(c => day10(c.closure_date)));
+  const specialty = Object.fromEntries(providersRes.rows.map(p => [p.Name, String(p.specialty || '').split(/[,/]/).map(x => x.trim().toUpperCase()).filter(Boolean)]));
+  const providerOut = (a) => ooo.some(o => o.provider === a.provider && day10(o.ooo_date) === day10(a.appointment_date)
+    && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
+  const appts = apptsAll.filter(a => {
+    const date = day10(a.appointment_date);
+    return date < today && !closed.has(date)
+      && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
+      && a.appointment_status !== 'Canceled' && a.appointment_status !== 'No Show'
+      && !providerOut(a);
+  });
+
+  const names = [...new Set(appts.map(a => a.patient_name).filter(Boolean))];
+  const patients = names.length
+    ? (await db.query('SELECT id, "Name", "ID_Number", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows
+    : [];
+  const byName = Object.fromEntries(patients.map(p => [p.Name, p]));
+  const history = await patientPrograms.historyFor(db, patients.map(p => p.id));
+
+  const entries = {};
+  if (await hasTable(db, 'EiHubEntries')) {
+    (await db.query('SELECT * FROM "EiHubEntries" WHERE appointment_date BETWEEN $1 AND $2', [start, end]))
+      .rows.forEach(e => { entries[e.session_key] = e; });
+  }
+
+  const sessions = [];
+  for (const a of appts) {
+    const date = day10(a.appointment_date);
+    const p = byName[a.patient_name] || {};
+    const services = specialty[a.provider] || [];
+    const hit = patientPrograms.programFor(history[p.id], date, services);
+    if (groupFor(hit ? hit.program : p.Program) !== 'EI') continue;
+    const startM = mins(a.appointment_time);
+    const duration = Number(a.duration) || 30;
+    const key = sessionKey(a);
+    const setting = SETTING_NAME[settingOf(a.treatment_area)] || null;
+    // A provider with more than one discipline (ST/OT) seeing a child with
+    // EI services in both: an appointment doesn't say which service it was,
+    // so don't guess -- programFor would just take the first.
+    const eiServices = [...new Set((history[p.id] || [])
+      .filter(r => r.program === 'EI' && r.service && services.includes(r.service) && patientPrograms.activeOn(r, date))
+      .map(r => r.service))];
+    const unclear = eiServices.length > 1;
+    const service = unclear ? null : hit?.service || (services.length === 1 ? services[0] : null);
+    const authorization = unclear ? null : hit?.authorization || null;
+    const problems = [];
+    if (!p.ID_Number) problems.push('No ID # (EI child ID) on the patient');
+    if (unclear) problems.push(`Check the service: ${a.provider} could have given ${eiServices.join(' or ')}`);
+    else if (!authorization) problems.push(`No EI authorization number for ${service || 'this service'} on this date`);
+    if (!setting) problems.push('No room or offsite setting');
+    const e = entries[key];
+    sessions.push({
+      key,
+      appointment_id: a.id,
+      date,
+      start_time: toTime(startM),
+      end_time: toTime(startM + duration),
+      duration,
+      patient_name: a.patient_name,
+      ei_child_id: p.ID_Number || null,
+      provider: a.provider,
+      service,
+      service_options: unclear ? eiServices : null,
+      authorization,
+      setting,
+      is_makeup: !!a.is_makeup,
+      is_eval: !!a.is_eval,
+      problems,
+      entered: e ? {
+        by: e.entered_by,
+        at: e.entered_at,
+        // Moved, shortened or given to someone else after it was entered:
+        // EI-Hub may need correcting.
+        changed: day10(e.appointment_date) !== date || String(e.appointment_time).slice(0, 5) !== toTime(startM)
+          || Number(e.duration) !== duration || (e.provider || null) !== (a.provider || null),
+      } : null,
+    });
+  }
+  sessions.sort((x, y) => (x.date + x.start_time).localeCompare(y.date + y.start_time) || String(x.provider).localeCompare(String(y.provider)));
+  return { month, start, end, today, tracking: await hasTable(db, 'EiHubEntries'), sessions };
+}
+
 // The provider's approved PTO and UPTO for days in the month, in hours --
 // the same scheduled-hours cost as the request itself (lib/workSchedule.js),
 // counting only a cross-month request's days in this month.
@@ -277,6 +398,37 @@ async function handle(ctx) {
     })));
   }
 
+  // EI-Hub entry list (see eiHubSessions): Reception, Admin, Developer.
+  if (path === '/billing/ei-hub' && method === 'GET') {
+    if (!canManage(currentUser)) return json(403, { error: 'Only Reception and Admins can see the EI-Hub list.' });
+    const month = String(qs.month || '').trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) return json(400, { error: 'Choose a month.' });
+    return json(200, await eiHubSessions(db, month));
+  }
+
+  // Ticks (or unticks) a session as entered in EI-Hub. The body carries the
+  // session as it is now, kept with the tick to spot later changes.
+  if (path === '/billing/ei-hub/entered' && method === 'PUT') {
+    if (!canManage(currentUser)) return json(403, { error: 'Only Reception and Admins can mark sessions entered.' });
+    const { session_key: key, entered, patient_name, appointment_date, appointment_time, duration, provider } = body || {};
+    if (!SESSION_KEY_RE.test(String(key || ''))) return json(400, { error: 'Unknown session.' });
+    if (!(await hasTable(db, 'EiHubEntries'))) return json(409, { error: 'Tracking EI-Hub entry needs the 2026-10-20 migration. Ask an admin to run it.' });
+    if (!entered) {
+      await db.query('DELETE FROM "EiHubEntries" WHERE session_key=$1', [key]);
+      return json(200, { ok: true });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointment_date || '')) || !/^\d{2}:\d{2}/.test(String(appointment_time || '')) || !(Number(duration) > 0)) {
+      return json(400, { error: 'The session date, time and length are required.' });
+    }
+    await db.query(
+      `INSERT INTO "EiHubEntries" (session_key, patient_name, appointment_date, appointment_time, duration, provider, entered_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (session_key) DO UPDATE SET patient_name=$2, appointment_date=$3, appointment_time=$4, duration=$5, provider=$6, entered_by=$7, entered_at=now()`,
+      [key, patient_name || null, appointment_date, String(appointment_time).slice(0, 5), Number(duration), provider || null, currentUser.username]
+    );
+    return json(200, { ok: true });
+  }
+
   // The REVIEWED box: Admin and Developer.
   if (path === '/billing/review' && method === 'PUT') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Only an Admin or Developer can mark a sheet reviewed.' });
@@ -298,4 +450,4 @@ async function handle(ctx) {
   return null;
 }
 
-module.exports = { handle, groupFor, buildSheet };
+module.exports = { handle, groupFor, buildSheet, eiHubSessions, sessionKey };

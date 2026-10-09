@@ -136,6 +136,12 @@ Show the results before shipping.
 - Past appointments can be changed by anyone. A lock on past dates with an approval step was tried and removed (Oct 2026; `2026-10-15_drop_schedule_change_requests.sql`).
 - Migration: `2026-10-13_billing.sql` (closure types, billing reviews).
 
+## EI-Hub entry (Oct 2026)
+
+- The clinic types EI sessions into the state's EI-Hub by hand (it has no API; it accepts 837P files, which come later, once the state's companion guide is in hand). `GET /billing/ei-hub?month=` (`eiHubSessions` in `routes/billing.js`, Reception/Admin/Developer) lists every EI session that took place: day over, not a closure, provider not out, not Canceled / No Show / HOLD, and billing under EI on its date for the provider's discipline. Each has the child's `ID_Number` (their EI child ID), the service, its EI authorization number (`PatientPrograms.authorization_number`) and the setting, plus `problems`. A provider with two disciplines seeing a child with EI in both gets no service (it's flagged) rather than a guess.
+- `PUT /billing/ei-hub/entered` ticks or unticks a session in `EiHubEntries` (audited as "EI-Hub entry"). `session_key` is `appt:<id>` or `series:<series id>:<original date>`, so editing a series date into its own row keeps its tick. The row keeps the date/time/length/provider at the time, and a mismatch later comes back as `entered.changed`.
+- Migration: `2026-10-20_ei_hub.sql`.
+
 ## Patient programs and mandates (Oct 2026)
 
 - `PatientPrograms` (migration `2026-10-14_patient_programs.sql`, `lib/patientPrograms.js`): one row per program × service with its mandate (`sessions` '2' or '1-2' per week × `minutes`) and `start_date` / `end_date` (NULL = from the beginning / current). A program with no mandate yet is a row with `service` NULL. Patients brought over by the migration keep their old free-text Mandate on those rows as `legacy_mandate`.
