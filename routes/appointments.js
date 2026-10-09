@@ -2,6 +2,7 @@ const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
+const { isHold } = require('../lib/caseload');
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).
@@ -103,6 +104,8 @@ async function handle(ctx) {
       const orig = (await db.query('SELECT * FROM "Appointments" WHERE id=$1 AND deleted = false', [body.makeup_for])).rows[0];
       if (!orig) return json(404, { error: 'The canceled appointment this makes up for was not found. It may have been deleted.' });
       if (!MISSED_STATUSES.includes(orig.appointment_status)) return json(400, { error: 'Only a canceled or no-show appointment can get a make-up.' });
+      // HOLD is a placeholder, not a patient: there's no missed session to make up.
+      if (isHold(orig.patient_name)) return json(400, { error: 'A HOLD placeholder can\'t get a make-up.' });
       const already = (await db.query(
         `SELECT 1 FROM "Appointments" WHERE makeup_for=$1 AND deleted = false AND appointment_status <> ALL($2) LIMIT 1`,
         [orig.id, MISSED_STATUSES]
