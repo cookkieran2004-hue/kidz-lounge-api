@@ -1,5 +1,5 @@
 const { json } = require('../lib/http');
-const { canManage, canAdminister } = require('../lib/roles');
+const { canManage, canUseEiHub, canAdminister } = require('../lib/roles');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
 const { clinicToday, isHold, currentCaseloads } = require('../lib/caseload');
 const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
@@ -403,9 +403,9 @@ async function handle(ctx) {
     })));
   }
 
-  // EI-Hub entry list (see eiHubSessions): Reception, Admin, Developer.
+  // EI-Hub entry list (see eiHubSessions): Developers only for now.
   if (path === '/billing/ei-hub' && method === 'GET') {
-    if (!canManage(currentUser)) return json(403, { error: 'Only Reception and Admins can see the EI-Hub list.' });
+    if (!canUseEiHub(currentUser)) return json(403, { error: 'The EI-Hub list is only open to Developers for now.' });
     const month = String(qs.month || '').trim();
     if (!/^\d{4}-\d{2}$/.test(month)) return json(400, { error: 'Choose a month.' });
     return json(200, await eiHubSessions(db, month));
@@ -414,7 +414,7 @@ async function handle(ctx) {
   // Ticks (or unticks) a session as entered in EI-Hub. The body carries the
   // session as it is now, kept with the tick to spot later changes.
   if (path === '/billing/ei-hub/entered' && method === 'PUT') {
-    if (!canManage(currentUser)) return json(403, { error: 'Only Reception and Admins can mark sessions entered.' });
+    if (!canUseEiHub(currentUser)) return json(403, { error: 'The EI-Hub list is only open to Developers for now.' });
     const { session_key: key, entered, patient_name, appointment_date, appointment_time, duration, provider } = body || {};
     if (!SESSION_KEY_RE.test(String(key || ''))) return json(400, { error: 'Unknown session.' });
     if (!(await hasTable(db, 'EiHubEntries'))) return json(409, { error: 'Tracking EI-Hub entry needs the 2026-10-20 migration. Ask an admin to run it.' });
