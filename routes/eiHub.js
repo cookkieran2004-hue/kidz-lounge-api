@@ -16,14 +16,18 @@ const { ALLOWED_CODES, COUNTY_CODES, validNpi, normalizeIcd10 } = require('../li
 //   PUT  /ei-hub/children/:id
 //   PUT  /ei-hub/referrals/:authorization
 
-const MIGRATION = 'This needs the 2026-10-21 database update. Ask an admin to run it.';
+const MIGRATION = 'This needs the 2026-10-20 and 2026-10-21 database updates. Ask an admin to run them.';
 const DENIED = 'EI-Hub billing is only open to Developers for now.';
 let ready = false;
 async function hasSetup(db) {
   if (ready) return true;
+  // This part's tables and columns, and the authorization number from the
+  // 2026-10-20 migration that the children list reads.
   const r = await db.query(`SELECT to_regclass('"EiReferrals"') AS t,
-    (SELECT COUNT(*)::int FROM information_schema.columns WHERE table_name = 'Patients' AND column_name = 'diagnosis_codes') AS c`);
-  if (r.rows[0]?.t && r.rows[0]?.c) ready = true;
+    (SELECT COUNT(*)::int FROM information_schema.columns
+     WHERE (table_name = 'Patients' AND column_name = 'diagnosis_codes')
+        OR (table_name = 'PatientPrograms' AND column_name = 'authorization_number')) AS c`);
+  if (r.rows[0]?.t && r.rows[0]?.c === 2) ready = true;
   return ready;
 }
 
@@ -32,6 +36,11 @@ const text = (v, max = 60) => {
   const s = String(v ?? '').trim();
   return s ? s.slice(0, max) : null;
 };
+// Providers has no archived column: a provider is archived when their staff
+// account is (the same rule as routes/providers.js).
+const PROVIDER_COLUMNS = `p.id, p."Name", p.first_name, p.last_name, p.specialty, p.npi, p.ei_first_name, p.ei_last_name, p.ei_default_codes,
+  (EXISTS (SELECT 1 FROM "Staff" s WHERE s.provider_name = p."Name" AND s.archived = true)
+   AND NOT EXISTS (SELECT 1 FROM "Staff" s WHERE s.provider_name = p."Name" AND s.archived = false)) AS archived`;
 const disciplinesOf = (specialty) => String(specialty || '').split(/[,/]/).map(x => x.trim().toUpperCase()).filter(Boolean);
 
 // Shared address checks; returns { values } or { error }.
@@ -59,7 +68,7 @@ async function handle(ctx) {
     if (!(await hasSetup(db))) return json(200, { available: false, ...lists });
     const [agency, providers] = await Promise.all([
       db.query('SELECT * FROM "EiBillingSettings" WHERE id = 1'),
-      db.query('SELECT id, "Name", first_name, last_name, specialty, archived, npi, ei_first_name, ei_last_name, ei_default_codes FROM "Providers" ORDER BY archived, "Name"'),
+      db.query(`SELECT ${PROVIDER_COLUMNS} FROM "Providers" p ORDER BY archived, p."Name"`),
     ]);
     return json(200, { available: true, agency: agency.rows[0] || null, providers: providers.rows, ...lists });
   }
@@ -109,12 +118,11 @@ async function handle(ctx) {
       if (clean.length > 4) return json(400, { error: `Choose up to 4 ${disc} codes.` });
       codes[disc] = clean;
     }
-    const row = (await db.query(
-      `UPDATE "Providers" SET npi=$1, ei_first_name=$2, ei_last_name=$3, ei_default_codes=$4 WHERE "Name"=$5
-       RETURNING id, "Name", first_name, last_name, specialty, archived, npi, ei_first_name, ei_last_name, ei_default_codes`,
+    await db.query(
+      'UPDATE "Providers" SET npi=$1, ei_first_name=$2, ei_last_name=$3, ei_default_codes=$4 WHERE "Name"=$5',
       [npi || null, text(b.ei_first_name, 35), text(b.ei_last_name, 60), Object.keys(codes).length ? JSON.stringify(codes) : null, name]
-    )).rows[0];
-    return json(200, row);
+    );
+    return json(200, (await db.query(`SELECT ${PROVIDER_COLUMNS} FROM "Providers" p WHERE p."Name"=$1`, [name])).rows[0]);
   }
 
   if (path === '/ei-hub/children' && method === 'GET') {
