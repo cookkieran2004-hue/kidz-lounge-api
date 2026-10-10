@@ -234,6 +234,27 @@ function sessionKey(a) {
 }
 const SESSION_KEY_RE = /^(appt:[\w-]+|series:[\w-]+:\d{4}-\d{2}-\d{2})$/;
 
+// Whether a session with a provider of these disciplines bills under EI on
+// this date, and for which service: null when it doesn't, else { service,
+// authorization, mandate, options }. A provider with more than one
+// discipline (ST/OT) seeing a child with EI services in both: an appointment
+// doesn't say which service it was, so don't guess (programFor would just
+// take the first) -- options lists them and service is null.
+function eiServiceFor(rows, date, services, programSummary) {
+  const hit = patientPrograms.programFor(rows, date, services);
+  if (groupFor(hit ? hit.program : programSummary) !== 'EI') return null;
+  const options = [...new Set((rows || [])
+    .filter(r => r.program === 'EI' && r.service && services.includes(r.service) && patientPrograms.activeOn(r, date))
+    .map(r => r.service))];
+  if (options.length > 1) return { service: null, authorization: null, mandate: null, options };
+  return {
+    service: hit?.service || (services.length === 1 ? services[0] : null),
+    authorization: hit?.authorization || null,
+    mandate: hit?.mandate || null,
+    options: null,
+  };
+}
+
 async function eiHubSessions(db, month) {
   const start = `${month}-01`;
   const [y, m] = month.split('-').map(Number);
@@ -275,21 +296,14 @@ async function eiHubSessions(db, month) {
     const date = day10(a.appointment_date);
     const p = byName[a.patient_name] || {};
     const services = specialty[a.provider] || [];
-    const hit = patientPrograms.programFor(history[p.id], date, services);
-    if (groupFor(hit ? hit.program : p.Program) !== 'EI') continue;
+    const ei = eiServiceFor(history[p.id], date, services, p.Program);
+    if (!ei) continue;
+    const { service, authorization, options: eiServices } = ei;
+    const unclear = !!eiServices;
     const startM = mins(a.appointment_time);
     const duration = Number(a.duration) || 30;
     const key = sessionKey(a);
     const setting = SETTING_NAME[settingOf(a.treatment_area)] || null;
-    // A provider with more than one discipline (ST/OT) seeing a child with
-    // EI services in both: an appointment doesn't say which service it was,
-    // so don't guess -- programFor would just take the first.
-    const eiServices = [...new Set((history[p.id] || [])
-      .filter(r => r.program === 'EI' && r.service && services.includes(r.service) && patientPrograms.activeOn(r, date))
-      .map(r => r.service))];
-    const unclear = eiServices.length > 1;
-    const service = unclear ? null : hit?.service || (services.length === 1 ? services[0] : null);
-    const authorization = unclear ? null : hit?.authorization || null;
     const problems = [];
     if (!p.ID_Number) problems.push('No ID # (EI child ID) on the patient');
     if (unclear) problems.push(`Check the service: ${a.provider} could have given ${eiServices.join(' or ')}`);

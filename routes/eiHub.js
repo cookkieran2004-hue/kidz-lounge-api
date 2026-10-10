@@ -1,5 +1,5 @@
 const { json } = require('../lib/http');
-const { canUseEiHub } = require('../lib/roles');
+const { canUseEiHub, canManage } = require('../lib/roles');
 const { ALLOWED_CODES, COUNTY_CODES, validNpi, normalizeIcd10, codesFor, linesFor, visitRate } = require('../lib/eiHubCodes');
 const { build837, splitName, splitCharge } = require('../lib/ei837');
 const { eiHubSessions } = require('./billing');
@@ -17,8 +17,9 @@ const history = require('../lib/eiHistory');
 //   PUT  /ei-hub/setup/agency
 //   PUT  /ei-hub/setup/providers/:name
 //   GET  /ei-hub/children                 EI children with their billing details
-//   PUT  /ei-hub/children/:id
-//   PUT  /ei-hub/referrals/:authorization
+//   PUT  /ei-hub/children/:id              (and /versions/:id) Reception too
+//   PUT  /ei-hub/referrals/:authorization  (and /periods/:id) Reception too
+//   GET  /ei-hub/patient/:id               one child's EI Billing tab on the chart: Reception too
 //   GET  /ei-hub/claims?month=YYYY-MM       part 2: each EI session, its codes and what blocks a claim
 //   PUT  /ei-hub/claims/codes               change one session's codes (or back to the defaults)
 //   POST /ei-hub/claim-files                make an 837P file from chosen sessions
@@ -126,26 +127,13 @@ async function claimData(db, month) {
     const patient = patients[x.patient_name] || {};
     const versions = childVersions[patient.id] || [];
     const child = history.versionOn(versions, x.date) || {};
-    const current = versions.find(v => !v.end_date);
     const childId = child.ei_child_id || (versions.length ? null : patient.ID_Number);
     const pos = PLACE_OF_SERVICE[x.setting] || null;
     if (x.is_eval) problems.push("Evals aren't billed by file yet");
     if (!x.service) problems.push(x.service_options ? `Check the service (${x.service_options.join(' or ')})` : 'No service');
     if (!x.authorization) problems.push('No auth #');
     if (!pos) problems.push('No room or offsite setting');
-    if (!versions.length) problems.push('No EI details entered');
-    else if (!child.id) problems.push('No EI details in effect on this date');
-    if (!childId) problems.push('No ID #');
-    // Edited on the patient record but not in the EI details: don't bill
-    // either until someone checks which is right.
-    if (current && patient.ID_Number && current.ei_child_id && patient.ID_Number !== current.ei_child_id) {
-      problems.push(`ID # on the patient record (${patient.ID_Number}) doesn't match the EI details (${current.ei_child_id})`);
-    }
-    if (!(child.date_of_birth || patient.Date_of_Birth)) problems.push('No date of birth');
-    if (!child.sex) problems.push('No sex');
-    if (!child.address_line1 || !child.city || !child.state || !child.zip) problems.push('No address');
-    if (child.county !== 'New York City') problems.push(child.county ? `County ${child.county} (only New York City for now)` : 'No county');
-    if (!child.diagnosis_codes) problems.push('No diagnosis');
+    problems.push(...childProblems(versions, patient, x.date));
     const referral = x.authorization ? history.versionOn(referralPeriods[x.authorization], x.date) : null;
     if (x.service && x.service !== 'SI' && x.authorization && !referral) {
       problems.push((referralPeriods[x.authorization] || []).length ? 'No referring provider in effect on this date' : 'No referring provider');
@@ -195,6 +183,105 @@ async function claimData(db, month) {
 }
 
 const publicRow = ({ _build, ...rest }) => rest;
+
+// What a claim for this child on `date` would be missing from their EI
+// details (the version in effect then). Shared by the claims list and the
+// chart's EI Billing tab, so both say the same thing.
+function childProblems(versions, patient, date) {
+  const problems = [];
+  const child = history.versionOn(versions, date) || {};
+  const current = versions.find(v => !v.end_date);
+  const childId = child.ei_child_id || (versions.length ? null : patient.ID_Number);
+  if (!versions.length) problems.push('No EI details entered');
+  else if (!child.id) problems.push('No EI details in effect on this date');
+  if (!childId) problems.push('No ID #');
+  // Edited on the patient record but not in the EI details: don't bill
+  // either until someone checks which is right.
+  if (current && patient.ID_Number && current.ei_child_id && patient.ID_Number !== current.ei_child_id) {
+    problems.push(`ID # on the patient record (${patient.ID_Number}) doesn't match the EI details (${current.ei_child_id})`);
+  }
+  if (!(child.date_of_birth || patient.Date_of_Birth)) problems.push('No date of birth');
+  if (!child.sex) problems.push('No sex');
+  if (!child.address_line1 || !child.city || !child.state || !child.zip) problems.push('No address');
+  if (child.county !== 'New York City') problems.push(child.county ? `County ${child.county} (only New York City for now)` : 'No county');
+  if (!child.diagnosis_codes) problems.push('No diagnosis');
+  return problems;
+}
+
+// EI children with their current EI services, every version of their EI
+// details, and each authorization's referring providers: everyone with a
+// current EI program (or "EI" in their Program summary, before program
+// history). With patientId, just that patient, EI or not.
+async function loadChildren(db, patientId = null) {
+  const [patientsRes, servicesRes] = await Promise.all([
+    patientId
+      ? db.query('SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program" FROM "Patients" WHERE id=$1', [patientId])
+      : db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"
+                  FROM "Patients"
+                  WHERE id IN (SELECT patient_id FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL)
+                     OR ',' || REPLACE(COALESCE("Program", ''), ' ', '') || ',' LIKE '%,EI,%'
+                  ORDER BY "Name"`),
+    db.query(`SELECT patient_id, service, sessions, minutes, start_date, authorization_number
+              FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL AND service IS NOT NULL
+              ${patientId ? 'AND patient_id = $1' : ''} ORDER BY service`, patientId ? [patientId] : []),
+  ]);
+  const auths = [...new Set(servicesRes.rows.map(x => x.authorization_number).filter(Boolean))];
+  const [details, referrals] = await Promise.all([
+    history.versionsFor(db, 'child', patientsRes.rows.map(x => x.id)),
+    history.versionsFor(db, 'referral', auths),
+  ]);
+  const byPatient = {};
+  servicesRes.rows.forEach(x => {
+    const periods = x.authorization_number ? referrals[x.authorization_number] || [] : [];
+    (byPatient[x.patient_id] = byPatient[x.patient_id] || []).push({
+      service: x.service, mandate: x.sessions && x.minutes ? `${x.sessions}x${x.minutes}` : null,
+      start_date: history.day(x.start_date),
+      authorization_number: x.authorization_number || null,
+      referrals: periods,
+      referral: periods.find(r => !r.end_date) || null,
+    });
+  });
+  return patientsRes.rows.map(x => {
+    const versions = details[x.id] || [];
+    return { ...x, versions, current: versions.find(v => !v.end_date) || null, services: byPatient[x.id] || [] };
+  });
+}
+
+const today = () => {
+  // Clinic time (America/New_York), as 'YYYY-MM-DD'.
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+};
+
+// The patient chart's EI Billing tab: Reception, Admins and Developers.
+// Providers (staff) don't see EI billing information at all (Kieran, Oct 2026).
+async function chartRoutes({ path, method, db, currentUser }) {
+  const pm = path.match(/^\/ei-hub\/patient\/([^/]+)$/);
+  if (pm && method === 'GET') {
+    if (!canManage(currentUser)) return json(403, { error: 'EI billing details are only open to Reception, Admins and Developers.' });
+    if (!(await hasSetup(db))) return json(200, { available: false });
+    const [child] = await loadChildren(db, pm[1]);
+    if (!child) return json(404, { error: 'Patient not found.' });
+    const isEi = child.services.length > 0 || child.versions.length > 0
+      || (await db.query(`SELECT 1 FROM "PatientPrograms" WHERE patient_id=$1 AND program='EI' AND end_date IS NULL LIMIT 1`, [child.id])).rows.length > 0
+      || /(^|,)\s*EI\s*(,|$)/.test(child.Program || '');
+    if (!isEi) return json(200, { available: true, ei: false });
+    const date = today();
+    const services = child.services.map(s => {
+      const problems = [];
+      if (!s.authorization_number) problems.push('No auth #');
+      else if (s.service !== 'SI' && !history.versionOn(s.referrals, date)) problems.push('No referring provider');
+      return { ...s, problems };
+    });
+    const problems = childProblems(child.versions, child, date);
+    if (!services.length) problems.push('No EI services in the mandate');
+    return json(200, {
+      available: true, ei: true, child: { ...child, services, problems },
+      can_edit: canManage(currentUser), counties: Object.keys(COUNTY_CODES).sort(),
+    });
+  }
+
+  return null;
+}
 
 async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
   const b = body || {};
@@ -377,7 +464,15 @@ async function withClient(fn) {
 async function handle(ctx) {
   const { path, method, body, db, currentUser } = ctx;
   if (!path.startsWith('/ei-hub/')) return null;
-  if (!canUseEiHub(currentUser)) return json(403, { error: DENIED });
+  const chartResponse = await chartRoutes(ctx);
+  if (chartResponse) return chartResponse;
+  // A child's EI details and referring providers are edited from the chart
+  // too, by Reception as well (Kieran, Oct 2026); the rest of EI-Hub billing
+  // stays Admins and Developers.
+  const childEdit = /^\/ei-hub\/(children|referrals)\/[^/]+(\/(versions|periods)\/\d+)?$/.test(path) && method !== 'GET';
+  if (!(childEdit ? canManage(currentUser) : canUseEiHub(currentUser))) {
+    return json(403, { error: childEdit ? 'Only Reception, Admins and Developers can change EI details.' : DENIED });
+  }
   const b = body || {};
 
   const claimsResponse = await claimsRoutes(ctx);
@@ -447,41 +542,7 @@ async function handle(ctx) {
 
   if (path === '/ei-hub/children' && method === 'GET') {
     if (!(await hasSetup(db))) return json(200, { available: false, children: [] });
-    // Everyone with a current EI program (or "EI" in their Program summary,
-    // before program history), with their current EI services, every version
-    // of their EI details, and each authorization's referring providers.
-    const [patientsRes, servicesRes] = await Promise.all([
-      db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"
-                FROM "Patients"
-                WHERE id IN (SELECT patient_id FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL)
-                   OR ',' || REPLACE(COALESCE("Program", ''), ' ', '') || ',' LIKE '%,EI,%'
-                ORDER BY "Name"`),
-      db.query(`SELECT patient_id, service, sessions, minutes, start_date, authorization_number
-                FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL AND service IS NOT NULL ORDER BY service`),
-    ]);
-    const auths = [...new Set(servicesRes.rows.map(x => x.authorization_number).filter(Boolean))];
-    const [details, referrals] = await Promise.all([
-      history.versionsFor(db, 'child', patientsRes.rows.map(x => x.id)),
-      history.versionsFor(db, 'referral', auths),
-    ]);
-    const byPatient = {};
-    servicesRes.rows.forEach(x => {
-      const periods = x.authorization_number ? referrals[x.authorization_number] || [] : [];
-      (byPatient[x.patient_id] = byPatient[x.patient_id] || []).push({
-        service: x.service, mandate: x.sessions && x.minutes ? `${x.sessions}x${x.minutes}` : null,
-        start_date: history.day(x.start_date),
-        authorization_number: x.authorization_number || null,
-        referrals: periods,
-        referral: periods.find(r => !r.end_date) || null,
-      });
-    });
-    return json(200, {
-      available: true,
-      children: patientsRes.rows.map(x => {
-        const versions = details[x.id] || [];
-        return { ...x, versions, current: versions.find(v => !v.end_date) || null, services: byPatient[x.id] || [] };
-      }),
-    });
+    return json(200, { available: true, children: await loadChildren(db) });
   }
 
   // A change to a child's EI details, from a date (the earlier version is
