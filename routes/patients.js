@@ -4,7 +4,8 @@ const { currentCaseloads } = require('../lib/caseload');
 const { annotateMakeups } = require('../lib/recurring');
 const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
-const { canCaseManage, canAdminister } = require('../lib/roles');
+const { canCaseManage, canAdminister, canManage } = require('../lib/roles');
+const eiHub = require('./eiHub');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -95,7 +96,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (body.program_plan && (await patientPrograms.hasProgramsTable(db))) {
       const cleaned = patientPrograms.cleanPlan({ ...body.program_plan, effective_from: null });
       if (cleaned.error) return json(400, { error: cleaned.error });
-      plan = cleaned.plan;
+      plan = canManage(currentUser) ? cleaned.plan : await patientPrograms.keepAuthorizations(db, null, cleaned.plan);
+    }
+    // EI billing details from the form's EI tab (Reception, Admins and
+    // Developers only), checked before anything is saved.
+    let eiNew = null;
+    if (body.ei_details && canManage(currentUser)) {
+      eiNew = await eiHub.prepareNewChild(db, body.ei_details, ID_Number);
+      if (eiNew.error) return json(400, { error: eiNew.error });
     }
     // MRN is always generated here, never accepted from the client -- it's
     // the patient's permanent, computer-assigned unique identifier.
@@ -120,6 +128,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     let created = result.rows[0];
     if (plan) {
       await patientPrograms.applyPlan(db, created.id, plan, currentUser.username);
+      created = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [created.id])).rows[0];
+    }
+    if (eiNew) {
+      const saved = await eiHub.saveNewChild(db, created.id, eiNew, currentUser.username);
+      if (saved.error) return json(400, { error: `The patient was saved, but not their EI details: ${saved.error} Add them on the chart's EI Billing tab.` });
       created = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [created.id])).rows[0];
     }
     const withAlerts = (await hasAlertColumns(db)) ? await saveAlertFields(db, created.id, body) : null;
@@ -174,6 +187,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        FROM "PatientPrograms" WHERE patient_id=$1 ORDER BY end_date IS NOT NULL, start_date DESC NULLS LAST, program, service`,
       [id]
     )).rows;
+    // EI auth #s are EI billing information: not for providers (Kieran, Oct 2026).
+    if (!canManage(currentUser)) rows.forEach(r => { delete r.authorization_number; });
     return json(200, { available: true, rows });
   }
 
@@ -289,6 +304,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
           await client.query('ROLLBACK');
           return json(400, { error: 'Choose the date the program changes start. Only the first change can replace the old mandate for all dates.' });
         }
+        if (!canManage(currentUser)) await patientPrograms.keepAuthorizations(client, id, cleaned.plan);
         await patientPrograms.applyPlan(client, id, cleaned.plan, currentUser.username);
         updated = (await client.query('SELECT * FROM "Patients" WHERE id=$1', [id])).rows[0];
       }

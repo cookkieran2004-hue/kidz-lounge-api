@@ -259,12 +259,15 @@ async function chartRoutes({ path, method, db, currentUser }) {
   if (pm && method === 'GET') {
     if (!canManage(currentUser)) return json(403, { error: 'EI billing details are only open to Reception, Admins and Developers.' });
     if (!(await hasSetup(db))) return json(200, { available: false });
+    // The new-patient form: just the county list for its EI tab.
+    if (pm[1] === 'new') return json(200, { available: true, ei: false, can_edit: true, counties: Object.keys(COUNTY_CODES).sort() });
     const [child] = await loadChildren(db, pm[1]);
     if (!child) return json(404, { error: 'Patient not found.' });
     const isEi = child.services.length > 0 || child.versions.length > 0
       || (await db.query(`SELECT 1 FROM "PatientPrograms" WHERE patient_id=$1 AND program='EI' AND end_date IS NULL LIMIT 1`, [child.id])).rows.length > 0
       || /(^|,)\s*EI\s*(,|$)/.test(child.Program || '');
-    if (!isEi) return json(200, { available: true, ei: false });
+    // Not EI (now): the chart's tab says so, but the patient form still gets
+    // the child, for a patient being given EI in that same edit.
     const date = today();
     const services = child.services.map(s => {
       const problems = [];
@@ -275,7 +278,7 @@ async function chartRoutes({ path, method, db, currentUser }) {
     const problems = childProblems(child.versions, child, date);
     if (!services.length) problems.push('No EI services in the mandate');
     return json(200, {
-      available: true, ei: true, child: { ...child, services, problems },
+      available: true, ei: isEi, child: { ...child, services, problems },
       can_edit: canManage(currentUser), counties: Object.keys(COUNTY_CODES).sort(),
     });
   }
@@ -418,6 +421,49 @@ function cleanChild(b) {
       sex, ...addr.values, county: b.county || null, diagnosis_codes: codes.length ? codes.join(', ') : null,
     },
   };
+}
+
+function cleanReferral(b) {
+  const npi = digits(b.referring_npi);
+  const last = text(b.referring_last, 60);
+  if (!last) return { error: "Enter the referring provider's last name (or the organization's name)." };
+  if (!validNpi(npi)) return { error: "That NPI isn't valid. Check the referring provider's 10-digit NPI." };
+  return { values: { referring_last: last, referring_first: text(b.referring_first, 35), referring_npi: npi } };
+}
+
+// A new patient's EI billing details from the patient form's EI tab (POST
+// /patients, routes/patients.js): checked before the patient is created so
+// a mistake doesn't leave a patient saved without them. `ei` is the child's
+// details (ID # from the patient's own ID # field) plus `referrals`:
+// [{ authorization, referring_last, referring_first, referring_npi }].
+// Returns { error } or { child, referrals }.
+async function prepareNewChild(db, ei, idNumber) {
+  if (!(await hasSetup(db))) return { error: MIGRATION };
+  const child = cleanChild({ ...ei, ei_child_id: idNumber });
+  if (child.error) return { error: `EI tab: ${child.error}` };
+  const referrals = [];
+  for (const r of Array.isArray(ei.referrals) ? ei.referrals : []) {
+    const auth = String(r.authorization || '').trim();
+    if (!auth || !(r.referring_last || r.referring_first || r.referring_npi)) continue;
+    const cleaned = cleanReferral(r);
+    if (cleaned.error) return { error: `EI tab, auth ${auth}: ${cleaned.error}` };
+    referrals.push({ auth, values: cleaned.values });
+  }
+  return { child: child.values, referrals };
+}
+
+// Saves what prepareNewChild checked, as each record's first version (from
+// the start). An auth # that already has referring providers keeps them.
+async function saveNewChild(q, patientId, prepared, username) {
+  const r = await history.addVersion(q, 'child', patientId, prepared.child, null, username);
+  if (r.error) return r;
+  await mirrorChild(q, patientId);
+  for (const ref of prepared.referrals) {
+    if ((await history.listVersions(q, 'referral', ref.auth)).length) continue;
+    const out = await history.addVersion(q, 'referral', ref.auth, ref.values, null, username);
+    if (out.error) return out;
+  }
+  return {};
 }
 
 async function correctChildVersion(q, patientId, versionId, values, username) {
@@ -583,11 +629,9 @@ async function handle(ctx) {
     if (!auth || auth.length > 30) return json(400, { error: 'Unknown authorization number.' });
     let values = null;
     if (method === 'PUT') {
-      const npi = digits(b.referring_npi);
-      const last = text(b.referring_last, 60);
-      if (!last) return json(400, { error: "Enter the referring provider's last name (or the organization's name)." });
-      if (!validNpi(npi)) return json(400, { error: "That NPI isn't valid. Check the referring provider's 10-digit NPI." });
-      values = { referring_last: last, referring_first: text(b.referring_first, 35), referring_npi: npi };
+      const cleaned = cleanReferral(b);
+      if (cleaned.error) return json(400, { error: cleaned.error });
+      values = cleaned.values;
     }
     const effective = b.effective_from ? String(b.effective_from).slice(0, 10) : null;
     return withClient(async (q) => {
@@ -605,4 +649,4 @@ async function handle(ctx) {
   return null;
 }
 
-module.exports = { handle };
+module.exports = { handle, prepareNewChild, saveNewChild };
