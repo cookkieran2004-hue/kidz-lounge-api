@@ -4,6 +4,7 @@ const { ALLOWED_CODES, COUNTY_CODES, validNpi, normalizeIcd10, codesFor, linesFo
 const { build837, splitName, splitCharge } = require('../lib/ei837');
 const { eiHubSessions } = require('./billing');
 const { getPool } = require('../lib/db');
+const history = require('../lib/eiHistory');
 
 // EI-Hub 837P billing, part 1 (Oct 2026): the details every claim needs that
 // the rest of the app doesn't keep -- the agency (billing provider and
@@ -23,18 +24,18 @@ const { getPool } = require('../lib/db');
 //   POST /ei-hub/claim-files                make an 837P file from chosen sessions
 //   GET  /ei-hub/claim-files/:id            download a file again
 
-const MIGRATION = 'This needs the 2026-10-20 and 2026-10-21 database updates. Ask an admin to run them.';
+const MIGRATION = 'This needs the 2026-10-20, 2026-10-21 and 2026-10-23 database updates. Ask an admin to run them.';
 const DENIED = 'EI-Hub billing is only open to Admins and Developers.';
 let ready = false;
 async function hasSetup(db) {
   if (ready) return true;
-  // This part's tables and columns, and the authorization number from the
-  // 2026-10-20 migration that the children list reads.
-  const r = await db.query(`SELECT to_regclass('"EiReferrals"') AS t,
+  // This part's tables and columns, the authorization number from the
+  // 2026-10-20 migration, and the dated history from 2026-10-23.
+  const r = await db.query(`SELECT to_regclass('"EiReferralPeriods"') AS t, to_regclass('"PatientEiDetails"') AS h,
     (SELECT COUNT(*)::int FROM information_schema.columns
      WHERE (table_name = 'Patients' AND column_name = 'diagnosis_codes')
         OR (table_name = 'PatientPrograms' AND column_name = 'authorization_number')) AS c`);
-  if (r.rows[0]?.t && r.rows[0]?.c === 2) ready = true;
+  if (r.rows[0]?.t && r.rows[0]?.h && r.rows[0]?.c === 2) ready = true;
   return ready;
 }
 
@@ -89,13 +90,12 @@ async function claimData(db, month) {
   const names = [...new Set(sessions.map(x => x.patient_name))];
   const keys = sessions.map(x => x.key);
   const auths = [...new Set(sessions.map(x => x.authorization).filter(Boolean))];
-  const [agencyRes, providersRes, patientsRes, overridesRes, referralsRes, claimsRes] = await Promise.all([
+  const [agencyRes, providersRes, patientsRes, overridesRes, referralPeriods, claimsRes] = await Promise.all([
     db.query('SELECT * FROM "EiBillingSettings" WHERE id = 1'),
     db.query('SELECT "Name", first_name, last_name, npi, ei_first_name, ei_last_name, ei_default_codes FROM "Providers"'),
-    names.length ? db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", mrn, sex, address_line1, address_line2, city, state, zip, county, diagnosis_codes
-                             FROM "Patients" WHERE "Name" = ANY($1)`, [names]) : { rows: [] },
+    names.length ? db.query('SELECT id, "Name", "Date_of_Birth", "ID_Number", mrn FROM "Patients" WHERE "Name" = ANY($1)', [names]) : { rows: [] },
     keys.length ? db.query('SELECT session_key, codes FROM "EiSessionCodes" WHERE session_key = ANY($1)', [keys]) : { rows: [] },
-    auths.length ? db.query('SELECT * FROM "EiReferrals" WHERE authorization_number = ANY($1)', [auths]) : { rows: [] },
+    history.versionsFor(db, 'referral', auths),
     keys.length ? db.query(`SELECT c.*, f.file_name FROM "EiClaims" c JOIN "EiClaimFiles" f ON f.id = c.file_id
                             WHERE c.session_key = ANY($1) AND NOT c.test ORDER BY c.created_at`, [keys]) : { rows: [] },
   ]);
@@ -112,7 +112,9 @@ async function claimData(db, month) {
   const providers = Object.fromEntries(providersRes.rows.map(x => [x.Name, x]));
   const patients = Object.fromEntries(patientsRes.rows.map(x => [x.Name, x]));
   const overrides = Object.fromEntries(overridesRes.rows.map(x => [x.session_key, x.codes]));
-  const referrals = Object.fromEntries(referralsRes.rows.map(x => [x.authorization_number, x]));
+  // Every version of each child's EI details: a claim uses the one in effect
+  // on the session's date (lib/eiHistory.js).
+  const childVersions = await history.versionsFor(db, 'child', patientsRes.rows.map(x => x.id));
   const sent = {};
   claimsRes.rows.forEach(c => { sent[c.session_key] = c; }); // latest wins
   const cutoff = new Date(Date.now() - FILING_DAYS * 86400000).toISOString().slice(0, 10);
@@ -121,20 +123,33 @@ async function claimData(db, month) {
     const problems = [];
     const warnings = [];
     const prov = providers[x.provider] || {};
-    const child = patients[x.patient_name] || {};
+    const patient = patients[x.patient_name] || {};
+    const versions = childVersions[patient.id] || [];
+    const child = history.versionOn(versions, x.date) || {};
+    const current = versions.find(v => !v.end_date);
+    const childId = child.ei_child_id || (versions.length ? null : patient.ID_Number);
     const pos = PLACE_OF_SERVICE[x.setting] || null;
     if (x.is_eval) problems.push("Evals aren't billed by file yet");
     if (!x.service) problems.push(x.service_options ? `Check the service (${x.service_options.join(' or ')})` : 'No service');
     if (!x.authorization) problems.push('No auth #');
     if (!pos) problems.push('No room or offsite setting');
-    if (!child.ID_Number) problems.push('No ID #');
-    if (!child.Date_of_Birth) problems.push('No date of birth');
+    if (!versions.length) problems.push('No EI details entered');
+    else if (!child.id) problems.push('No EI details in effect on this date');
+    if (!childId) problems.push('No ID #');
+    // Edited on the patient record but not in the EI details: don't bill
+    // either until someone checks which is right.
+    if (current && patient.ID_Number && current.ei_child_id && patient.ID_Number !== current.ei_child_id) {
+      problems.push(`ID # on the patient record (${patient.ID_Number}) doesn't match the EI details (${current.ei_child_id})`);
+    }
+    if (!(child.date_of_birth || patient.Date_of_Birth)) problems.push('No date of birth');
     if (!child.sex) problems.push('No sex');
     if (!child.address_line1 || !child.city || !child.state || !child.zip) problems.push('No address');
     if (child.county !== 'New York City') problems.push(child.county ? `County ${child.county} (only New York City for now)` : 'No county');
     if (!child.diagnosis_codes) problems.push('No diagnosis');
-    const referral = x.authorization ? referrals[x.authorization] : null;
-    if (x.service && x.service !== 'SI' && x.authorization && !referral) problems.push('No referring provider');
+    const referral = x.authorization ? history.versionOn(referralPeriods[x.authorization], x.date) : null;
+    if (x.service && x.service !== 'SI' && x.authorization && !referral) {
+      problems.push((referralPeriods[x.authorization] || []).length ? 'No referring provider in effect on this date' : 'No referring provider');
+    }
     if (!prov.npi) problems.push(`No NPI for ${x.provider}`);
     const defaults = prov.ei_default_codes || {};
     const override = overrides[x.key] || null;
@@ -157,10 +172,15 @@ async function claimData(db, month) {
       claim: claim ? { claim_number: claim.claim_number, status: claim.status, file_name: claim.file_name, created_at: claim.created_at, eihub_claim_id: claim.eihub_claim_id } : null,
       // What lib/ei837.js needs (kept server side).
       _build: {
-        child: { ...splitName(x.patient_name), id: child.ID_Number, dob: child.Date_of_Birth, sex: child.sex, mrn: child.mrn,
-          address_line1: child.address_line1, address_line2: child.address_line2, city: child.city, state: child.state, zip: child.zip },
+        child: {
+          // Name and date of birth as EI-Hub has them, when entered.
+          first: child.first_name || splitName(x.patient_name).first, last: child.last_name || splitName(x.patient_name).last,
+          id: childId, dob: history.day(child.date_of_birth) || patient.Date_of_Birth, sex: child.sex, mrn: patient.mrn,
+          address_line1: child.address_line1, address_line2: child.address_line2, city: child.city, state: child.state, zip: child.zip,
+          version_id: child.id || null,
+        },
         diagnoses: String(child.diagnosis_codes || '').split(',').map(d => d.trim()).filter(Boolean),
-        referring: referral ? { last: referral.referring_last, first: referral.referring_first, npi: referral.referring_npi } : null,
+        referring: referral ? { last: referral.referring_last, first: referral.referring_first, npi: referral.referring_npi, period_id: referral.id } : null,
         rendering: { last: prov.ei_last_name || prov.last_name || splitName(x.provider).last, first: prov.ei_first_name || prov.first_name || splitName(x.provider).first, npi: prov.npi },
       },
     };
@@ -251,10 +271,12 @@ async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
       for (let i = 0; i < chosen.length; i++) {
         const r = chosen[i];
         await client.query(
-          `INSERT INTO "EiClaims" (claim_number, file_id, session_key, test, patient_name, provider, appointment_date, start_time, end_time, service, authorization_number, codes, charge)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          `INSERT INTO "EiClaims" (claim_number, file_id, session_key, test, patient_name, provider, appointment_date, start_time, end_time, service, authorization_number, codes, charge, details)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
           [claims[i].claim_number, file.id, r.key, test, r.patient_name, r.provider, r.date, r.start_time, r.end_time, r.service, r.authorization,
-            JSON.stringify(r.codes), r.lines.reduce((t, l) => t + l.charge, 0)]
+            JSON.stringify(r.codes), r.lines.reduce((t, l) => t + l.charge, 0),
+            // Exactly what this claim said, kept with it (what the agency billed, and when).
+            JSON.stringify(claims[i])]
         );
       }
       await client.query('COMMIT');
@@ -275,6 +297,72 @@ async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
     return json(200, file);
   }
   return null;
+}
+
+// A child's EI details from a form; returns { values } or { error }.
+function cleanChild(b) {
+  const sex = b.sex ? String(b.sex).toUpperCase() : null;
+  if (sex && !['F', 'M'].includes(sex)) return { error: 'Sex must be F or M.' };
+  if (b.county && !COUNTY_CODES[b.county]) return { error: 'Choose the county from the list.' };
+  const addr = cleanAddress(b);
+  if (addr.error) return { error: addr.error };
+  const codes = [];
+  for (const part of String(b.diagnosis_codes || '').split(/[,;\n]/)) {
+    if (!part.trim()) continue;
+    const code = normalizeIcd10(part);
+    if (code === undefined) return { error: `"${part.trim()}" isn't an ICD-10 code. Codes look like F80.2.` };
+    if (!codes.includes(code)) codes.push(code);
+  }
+  if (codes.length > 12) return { error: 'A claim can carry up to 12 diagnosis codes.' };
+  const dob = b.date_of_birth ? String(b.date_of_birth).slice(0, 10) : null;
+  if (dob && !/^\d{4}-\d{2}-\d{2}$/.test(dob)) return { error: 'Enter the date of birth as EI-Hub has it.' };
+  return {
+    values: {
+      ei_child_id: text(b.ei_child_id, 30), first_name: text(b.first_name, 35), last_name: text(b.last_name, 60), date_of_birth: dob,
+      sex, ...addr.values, county: b.county || null, diagnosis_codes: codes.length ? codes.join(', ') : null,
+    },
+  };
+}
+
+async function correctChildVersion(q, patientId, versionId, values, username) {
+  const own = (await q.query('SELECT id FROM "PatientEiDetails" WHERE id=$1 AND patient_id=$2', [versionId, patientId])).rows[0];
+  return own ? history.correctVersion(q, 'child', own.id, values, username) : { error: 'That version no longer exists. Reload and try again.' };
+}
+
+// The patient record keeps a copy of the current EI details, for the rest of
+// the app (the ID # is the child's EI ID). Claims always read the versions.
+async function mirrorChild(q, patientId) {
+  const current = (await q.query('SELECT * FROM "PatientEiDetails" WHERE patient_id=$1 AND end_date IS NULL ORDER BY id DESC LIMIT 1', [patientId])).rows[0];
+  if (!current) return;
+  await q.query(
+    `UPDATE "Patients" SET "ID_Number" = COALESCE($1, "ID_Number"), sex=$2, address_line1=$3, address_line2=$4, city=$5, state=$6, zip=$7, county=$8, diagnosis_codes=$9 WHERE id=$10`,
+    [current.ei_child_id, current.sex, current.address_line1, current.address_line2, current.city, current.state, current.zip, current.county, current.diagnosis_codes, patientId]
+  );
+}
+
+// A version a sent claim was built from stays in the history for good (the
+// agency's record of what it billed): it can be corrected or replaced from a
+// date, not taken back. Test files don't count. Returns { error } or null.
+async function billedWith(q, kind, id) {
+  const path = kind === 'child' ? "details->'child'->>'version_id'" : "details->'referring'->>'period_id'";
+  const used = (await q.query(`SELECT claim_number FROM "EiClaims" WHERE NOT test AND ${path} = $1 LIMIT 1`, [String(id)])).rows[0];
+  return used ? { error: `Claim ${used.claim_number} was billed with this, so it stays in the history. Correct it, or add a new version from a date.` } : null;
+}
+
+// Runs fn(client) in a transaction; fn returns { status, body }.
+async function withClient(fn) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const out = await fn(client);
+    await client.query(out.status < 400 ? 'COMMIT' : 'ROLLBACK');
+    return json(out.status, out.body);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function handle(ctx) {
@@ -351,9 +439,10 @@ async function handle(ctx) {
   if (path === '/ei-hub/children' && method === 'GET') {
     if (!(await hasSetup(db))) return json(200, { available: false, children: [] });
     // Everyone with a current EI program (or "EI" in their Program summary,
-    // before program history), with their current EI services.
+    // before program history), with their current EI services, every version
+    // of their EI details, and each authorization's referring providers.
     const [patientsRes, servicesRes] = await Promise.all([
-      db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program", sex, address_line1, address_line2, city, state, zip, county, diagnosis_codes
+      db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"
                 FROM "Patients"
                 WHERE id IN (SELECT patient_id FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL)
                    OR ',' || REPLACE(COALESCE("Program", ''), ' ', '') || ',' LIKE '%,EI,%'
@@ -361,69 +450,86 @@ async function handle(ctx) {
       db.query(`SELECT patient_id, service, sessions, minutes, start_date, authorization_number
                 FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL AND service IS NOT NULL ORDER BY service`),
     ]);
-    const auths = [...new Set(servicesRes.rows.map(s => s.authorization_number).filter(Boolean))];
-    const referrals = auths.length
-      ? Object.fromEntries((await db.query('SELECT * FROM "EiReferrals" WHERE authorization_number = ANY($1)', [auths])).rows.map(r => [r.authorization_number, r]))
-      : {};
+    const auths = [...new Set(servicesRes.rows.map(x => x.authorization_number).filter(Boolean))];
+    const [details, referrals] = await Promise.all([
+      history.versionsFor(db, 'child', patientsRes.rows.map(x => x.id)),
+      history.versionsFor(db, 'referral', auths),
+    ]);
     const byPatient = {};
-    servicesRes.rows.forEach(s => {
-      (byPatient[s.patient_id] = byPatient[s.patient_id] || []).push({
-        service: s.service, mandate: s.sessions && s.minutes ? `${s.sessions}x${s.minutes}` : null,
-        start_date: s.start_date ? String(s.start_date).slice(0, 10) : null,
-        authorization_number: s.authorization_number || null,
-        referral: s.authorization_number ? referrals[s.authorization_number] || null : null,
+    servicesRes.rows.forEach(x => {
+      const periods = x.authorization_number ? referrals[x.authorization_number] || [] : [];
+      (byPatient[x.patient_id] = byPatient[x.patient_id] || []).push({
+        service: x.service, mandate: x.sessions && x.minutes ? `${x.sessions}x${x.minutes}` : null,
+        start_date: history.day(x.start_date),
+        authorization_number: x.authorization_number || null,
+        referrals: periods,
+        referral: periods.find(r => !r.end_date) || null,
       });
     });
-    return json(200, { available: true, children: patientsRes.rows.map(p => ({ ...p, services: byPatient[p.id] || [] })) });
+    return json(200, {
+      available: true,
+      children: patientsRes.rows.map(x => {
+        const versions = details[x.id] || [];
+        return { ...x, versions, current: versions.find(v => !v.end_date) || null, services: byPatient[x.id] || [] };
+      }),
+    });
   }
 
+  // A change to a child's EI details, from a date (the earlier version is
+  // kept); a correction to one version; or taking back the newest version.
   const cm = path.match(/^\/ei-hub\/children\/([^/]+)$/);
-  if (cm && method === 'PUT') {
+  const cvm = path.match(/^\/ei-hub\/children\/([^/]+)\/versions\/(\d+)$/);
+  if ((cm && method === 'PUT') || (cvm && (method === 'PUT' || method === 'DELETE'))) {
     if (!(await hasSetup(db))) return json(409, { error: MIGRATION });
-    const sex = b.sex ? String(b.sex).toUpperCase() : null;
-    if (sex && !['F', 'M'].includes(sex)) return json(400, { error: 'Sex must be F or M.' });
-    if (b.county && !COUNTY_CODES[b.county]) return json(400, { error: 'Choose the county from the list.' });
-    const addr = cleanAddress(b);
-    if (addr.error) return json(400, { error: addr.error });
-    const codes = [];
-    for (const part of String(b.diagnosis_codes || '').split(/[,;\n]/)) {
-      if (!part.trim()) continue;
-      const code = normalizeIcd10(part);
-      if (code === undefined) return json(400, { error: `"${part.trim()}" isn't an ICD-10 code. Codes look like F80.2.` });
-      if (!codes.includes(code)) codes.push(code);
+    const patientId = (cm || cvm)[1];
+    const patient = (await db.query('SELECT id, "Name", "Date_of_Birth", "ID_Number" FROM "Patients" WHERE id=$1', [patientId])).rows[0];
+    if (!patient) return json(404, { error: 'Patient not found.' });
+    let values = null;
+    if (method === 'PUT') {
+      const cleaned = cleanChild(b);
+      if (cleaned.error) return json(400, { error: cleaned.error });
+      values = cleaned.values;
     }
-    if (codes.length > 12) return json(400, { error: 'A claim can carry up to 12 diagnosis codes.' });
-    const a = addr.values;
-    const row = (await db.query(
-      `UPDATE "Patients" SET sex=$1, address_line1=$2, address_line2=$3, city=$4, state=$5, zip=$6, county=$7, diagnosis_codes=$8
-       WHERE id=$9 RETURNING id, "Name", sex, address_line1, address_line2, city, state, zip, county, diagnosis_codes`,
-      [sex, a.address_line1, a.address_line2, a.city, a.state, a.zip, b.county || null, codes.length ? codes.join(', ') : null, cm[1]]
-    )).rows[0];
-    if (!row) return json(404, { error: 'Patient not found.' });
-    return json(200, row);
+    const effective = b.effective_from ? String(b.effective_from).slice(0, 10) : null;
+    if (effective && !/^\d{4}-\d{2}-\d{2}$/.test(effective)) return json(400, { error: 'Choose the date the change takes effect.' });
+    return withClient(async (q) => {
+      const result = cm
+        ? await history.addVersion(q, 'child', patientId, values, effective, currentUser.username)
+        : method === 'PUT'
+          ? await correctChildVersion(q, patientId, cvm[2], values, currentUser.username)
+          : (await billedWith(q, 'child', cvm[2])) || await history.deleteLatest(q, 'child', patientId, cvm[2]);
+      if (result.error) return { status: 400, body: { error: result.error } };
+      await mirrorChild(q, patientId);
+      return { status: 200, body: { versions: await history.listVersions(q, 'child', patientId) } };
+    });
   }
 
+  // The referring provider on an authorization, dated the same way.
   const rm = path.match(/^\/ei-hub\/referrals\/([^/]+)$/);
-  if (rm && method === 'PUT') {
+  const rvm = path.match(/^\/ei-hub\/referrals\/([^/]+)\/periods\/(\d+)$/);
+  if ((rm && method === 'PUT') || (rvm && (method === 'PUT' || method === 'DELETE'))) {
     if (!(await hasSetup(db))) return json(409, { error: MIGRATION });
-    const auth = decodeURIComponent(rm[1]).trim();
+    const auth = decodeURIComponent((rm || rvm)[1]).trim();
     if (!auth || auth.length > 30) return json(400, { error: 'Unknown authorization number.' });
-    const npi = digits(b.referring_npi);
-    const last = text(b.referring_last, 60);
-    if (!last && !npi) {
-      await db.query('DELETE FROM "EiReferrals" WHERE authorization_number=$1', [auth]);
-      return json(200, { authorization_number: auth, cleared: true });
+    let values = null;
+    if (method === 'PUT') {
+      const npi = digits(b.referring_npi);
+      const last = text(b.referring_last, 60);
+      if (!last) return json(400, { error: "Enter the referring provider's last name (or the organization's name)." });
+      if (!validNpi(npi)) return json(400, { error: "That NPI isn't valid. Check the referring provider's 10-digit NPI." });
+      values = { referring_last: last, referring_first: text(b.referring_first, 35), referring_npi: npi };
     }
-    if (!last) return json(400, { error: "Enter the referring provider's last name (or the organization's name)." });
-    if (!validNpi(npi)) return json(400, { error: "That NPI isn't valid. Check the referring provider's 10-digit NPI." });
-    const row = (await db.query(
-      `INSERT INTO "EiReferrals" (authorization_number, referring_last, referring_first, referring_npi, updated_by, updated_at)
-       VALUES ($1, $2, $3, $4, $5, now())
-       ON CONFLICT (authorization_number) DO UPDATE SET referring_last=$2, referring_first=$3, referring_npi=$4, updated_by=$5, updated_at=now()
-       RETURNING *`,
-      [auth, last, text(b.referring_first, 35), npi, currentUser.username]
-    )).rows[0];
-    return json(200, row);
+    const effective = b.effective_from ? String(b.effective_from).slice(0, 10) : null;
+    return withClient(async (q) => {
+      let result;
+      if (rm) result = await history.addVersion(q, 'referral', auth, values, effective, currentUser.username);
+      else if (method === 'PUT') {
+        const own = (await q.query('SELECT id FROM "EiReferralPeriods" WHERE id=$1 AND authorization_number=$2', [rvm[2], auth])).rows[0];
+        result = own ? await history.correctVersion(q, 'referral', own.id, values, currentUser.username) : { error: 'That referring provider entry no longer exists.' };
+      } else result = (await billedWith(q, 'referral', rvm[2])) || await history.deleteLatest(q, 'referral', auth, rvm[2]);
+      if (result.error) return { status: 400, body: { error: result.error } };
+      return { status: 200, body: { periods: await history.listVersions(q, 'referral', auth) } };
+    });
   }
 
   return null;
