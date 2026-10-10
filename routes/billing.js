@@ -422,6 +422,11 @@ async function handle(ctx) {
       await db.query('DELETE FROM "EiHubEntries" WHERE session_key=$1', [key]);
       return json(200, { ok: true });
     }
+    // Already in a claim file: entering it by hand too would bill it twice.
+    if (await hasTable(db, 'EiClaims')) {
+      const sent = (await db.query('SELECT claim_number FROM "EiClaims" WHERE session_key=$1 AND NOT test LIMIT 1', [key])).rows[0];
+      if (sent) return json(409, { error: `This session was already sent to EI-Hub in a claim file (${sent.claim_number}).` });
+    }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointment_date || '')) || !/^\d{2}:\d{2}/.test(String(appointment_time || '')) || !(Number(duration) > 0)) {
       return json(400, { error: 'The session date, time and length are required.' });
     }

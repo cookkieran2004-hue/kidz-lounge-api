@@ -162,7 +162,13 @@ async function claimData(db, month) {
     if (x.date < cutoff) warnings.push(`Over ${FILING_DAYS} days ago`);
     const charges = codes.length && pos ? splitCharge(visitRate(x.service, x.duration, pos), codes.length) : [];
     const claim = sent[x.key] || null;
+    // One status per session, from first to last (Kieran, Oct 2026: one
+    // list for getting each session into EI-Hub, by file or by hand):
+    // needs_fixing -> ready -> entered (typed into EI-Hub by hand) or
+    // sent (in a claim file) -> accepted / rejected (EI-Hub's 277, part 3).
+    const status = claim ? claim.status : x.entered ? 'entered' : problems.length ? 'needs_fixing' : 'ready';
     return {
+      status, entered: x.entered || null, ei_child_id: childId || null,
       key: x.key, date: x.date, start_time: x.start_time, end_time: x.end_time, duration: x.duration,
       patient_name: x.patient_name, provider: x.provider, service: x.service, authorization: x.authorization,
       setting: x.setting, place_of_service: pos, is_makeup: x.is_makeup, is_eval: x.is_eval,
@@ -242,6 +248,9 @@ async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
     if (blocked) return json(400, { error: `${blocked.patient_name} on ${blocked.date}: ${blocked.problems[0]}.` });
     const already = !test && chosen.find(r => r.claim);
     if (already) return json(409, { error: `${already.patient_name} on ${already.date} was already sent in ${already.claim.file_name}.` });
+    // Typed into EI-Hub by hand already: a file would bill it twice.
+    const byHand = !test && chosen.find(r => r.entered);
+    if (byHand) return json(409, { error: `${byHand.patient_name} on ${byHand.date} was already entered in EI-Hub by hand.` });
 
     const client = await getPool().connect();
     try {
