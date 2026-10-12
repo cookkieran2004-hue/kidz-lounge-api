@@ -6,6 +6,7 @@ const { verifyAdminPassword } = require('../lib/auth');
 const { mergedField, generateUniqueMRN, displayNameFor } = require('../lib/utils');
 const { canCaseManage, canAdminister, canManage } = require('../lib/roles');
 const eiHub = require('./eiHub');
+const eiImport = require('../lib/eiImport');
 
 // Allergies / Immunizations (migrations/2026-09-28_patient_allergies_immunizations.sql).
 // Checked once per cold start so a deploy that lands before the migration
@@ -234,6 +235,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         return json(404, { error: 'Patient not found' });
       }
       const existing = existingRes.rows[0];
+      // An EI child ID that came from an EI-Hub import is locked
+      // (migrations/2026-10-25_ei_child_id_lock.sql): imports refer back to it.
+      const lockedEiId = eiImport.lockedId(existing);
+      if (lockedEiId && Object.prototype.hasOwnProperty.call(body, 'ID_Number')
+        && String(body.ID_Number ?? '').trim() !== lockedEiId) {
+        await client.query('ROLLBACK');
+        return json(400, { error: `The ID # (${lockedEiId}) came from EI-Hub and is locked, so it can't be changed here.` });
+      }
       const oldName = existing.Name;
       const newName = nameProvided ? Name.trim() : oldName;
       // Resolved together, not independently mergedField'd -- these two

@@ -233,10 +233,11 @@ function childProblems(versions, patient, date) {
 // current EI program (or "EI" in their Program summary, before program
 // history). With patientId, just that patient, EI or not.
 async function loadChildren(db, patientId = null) {
+  const lockCol = (await eiImport.hasIdLock(db)) ? ', ei_id_locked_at' : '';
   const [patientsRes, servicesRes] = await Promise.all([
     patientId
-      ? db.query('SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program" FROM "Patients" WHERE id=$1', [patientId])
-      : db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"
+      ? db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"${lockCol} FROM "Patients" WHERE id=$1`, [patientId])
+      : db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number", "Status", "Program"${lockCol}
                   FROM "Patients"
                   WHERE id IN (SELECT patient_id FROM "PatientPrograms" WHERE program = 'EI' AND end_date IS NULL)
                      OR ',' || REPLACE(COALESCE("Program", ''), ' ', '') || ',' LIKE '%,EI,%'
@@ -263,7 +264,7 @@ async function loadChildren(db, patientId = null) {
   });
   return patientsRes.rows.map(x => {
     const versions = details[x.id] || [];
-    return { ...x, versions, current: versions.find(v => !v.end_date) || null, services: byPatient[x.id] || [] };
+    return { ...x, ei_id_locked: !!eiImport.lockedId(x), versions, current: versions.find(v => !v.end_date) || null, services: byPatient[x.id] || [] };
   });
 }
 
@@ -659,13 +660,19 @@ async function handle(ctx) {
   if ((cm && method === 'PUT') || (cvm && (method === 'PUT' || method === 'DELETE'))) {
     if (!(await hasSetup(db))) return json(409, { error: MIGRATION });
     const patientId = (cm || cvm)[1];
-    const patient = (await db.query('SELECT id, "Name", "Date_of_Birth", "ID_Number" FROM "Patients" WHERE id=$1', [patientId])).rows[0];
+    const withLock = await eiImport.hasIdLock(db);
+    const patient = (await db.query(`SELECT id, "Name", "Date_of_Birth", "ID_Number"${withLock ? ', ei_id_locked_at' : ''} FROM "Patients" WHERE id=$1`, [patientId])).rows[0];
     if (!patient) return json(404, { error: 'Patient not found.' });
     let values = null;
     if (method === 'PUT') {
       const cleaned = cleanChild(b);
       if (cleaned.error) return json(400, { error: cleaned.error });
       values = cleaned.values;
+      // A locked EI child ID (from an EI-Hub import) stays as it is.
+      const locked = eiImport.lockedId(patient);
+      if (locked && (values.ei_child_id || '') !== locked) {
+        return json(400, { error: `The EI child ID (${locked}) came from EI-Hub and is locked, so it can't be changed here.` });
+      }
     }
     const effective = b.effective_from ? String(b.effective_from).slice(0, 10) : null;
     if (effective && !/^\d{4}-\d{2}-\d{2}$/.test(effective)) return json(400, { error: 'Choose the date the change takes effect.' });
