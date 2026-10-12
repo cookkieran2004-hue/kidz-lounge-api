@@ -222,6 +222,20 @@ async function buildSheet(db, provider, month) {
 // *HOLD* and the HOLD placeholder.
 
 const SETTING_NAME = { C: 'Center', S: 'School', H: 'Home' };
+// An EI-Hub authorization's visit type: "Facility" (at the agency) or
+// "Basic" (home and community: the child's home, day care, school), from
+// Program ("Speech Language - Facility") or else Location Type. A child can
+// have both for one service at once, and EI-Hub rejects a session billed
+// against the wrong one (Kieran, Oct 2026: pick by the session's setting).
+function authVisitType(x) {
+  const kind = String(x.program || '').split(' - ').slice(1).join(' - ');
+  if (/facility/i.test(kind)) return 'facility';
+  if (/basic|home|community/i.test(kind)) return 'basic';
+  if (/agency provider site|facility/i.test(x.location_type || '')) return 'facility';
+  if (/home|day care|daycare|community|school/i.test(x.location_type || '')) return 'basic';
+  return null;
+}
+const VISIT_TYPE_OF_SETTING = { Center: 'facility', Home: 'basic', School: 'basic' };
 const day10 = (v) => String(v).slice(0, 10);
 const toTime = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
 
@@ -310,20 +324,27 @@ async function eiHubSessions(db, month) {
     const { service, options: eiServices } = ei;
     let { authorization } = ei;
     const unclear = !!eiServices;
+    const setting = SETTING_NAME[settingOf(a.treatment_area)] || null;
     const imported = service ? (eiAuths[p.id] || []).filter(x => x.service === service) : [];
-    const authRecord = imported.find(x => (!x.start_date || day10(x.start_date) <= date) && (!x.end_date || day10(x.end_date) >= date)) || null;
+    const covering = imported.filter(x => (!x.start_date || day10(x.start_date) <= date) && (!x.end_date || day10(x.end_date) >= date));
+    // The one for this session's setting (center: Facility; home / school:
+    // Basic); one of unknown type fits either. No setting: the first.
+    const wantType = VISIT_TYPE_OF_SETTING[setting] || null;
+    const authRecord = (wantType ? covering.find(x => authVisitType(x) === wantType) || covering.find(x => !authVisitType(x)) : covering[0]) || null;
+    const wrongType = !authRecord && covering.length > 0;
     if (authRecord) authorization = authRecord.authorization_number;
     const startM = mins(a.appointment_time);
     const duration = Number(a.duration) || 30;
     const key = sessionKey(a);
-    const setting = SETTING_NAME[settingOf(a.treatment_area)] || null;
     const problems = [];
     if (!p.ID_Number) problems.push('No ID # (EI child ID) on the patient');
     if (unclear) problems.push(`Check the service: ${a.provider} could have given ${eiServices.join(' or ')}`);
     // What the imported EI-Hub authorizations say (also blocks a claim file;
     // routes/eiHub.js claimData): EI-Hub rejects a session outside them.
     const authProblems = [];
-    if (!unclear && imported.length && !authRecord) authProblems.push(`No ${service} authorization in EI-Hub covers this date`);
+    if (!unclear && wrongType) {
+      authProblems.push(`The ${service} authorization for this date is ${authVisitType(covering[0]) === 'facility' ? 'Facility (at the agency)' : 'Basic (home / community)'}, but the session is ${setting === 'Center' ? 'at the center' : `at ${String(setting).toLowerCase()}`}`);
+    } else if (!unclear && imported.length && !authRecord) authProblems.push(`No ${service} authorization in EI-Hub covers this date`);
     if (authRecord && authRecord.suspended_start && day10(authRecord.suspended_start) <= date
       && (!authRecord.suspended_end || day10(authRecord.suspended_end) >= date)) authProblems.push('The authorization is suspended on this date');
     if (!unclear && !authProblems.length && !authorization) problems.push(`No EI authorization number for ${service || 'this service'} on this date`);
