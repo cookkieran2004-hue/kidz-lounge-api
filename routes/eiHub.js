@@ -5,6 +5,7 @@ const { build837, splitName, splitCharge } = require('../lib/ei837');
 const { eiHubSessions } = require('./billing');
 const { getPool } = require('../lib/db');
 const history = require('../lib/eiHistory');
+const eiImport = require('../lib/eiImport');
 
 // EI-Hub 837P billing, part 1 (Oct 2026): the details every claim needs that
 // the rest of the app doesn't keep -- the agency (billing provider and
@@ -20,6 +21,8 @@ const history = require('../lib/eiHistory');
 //   PUT  /ei-hub/children/:id              (and /versions/:id) Reception too
 //   PUT  /ei-hub/referrals/:authorization  (and /periods/:id) Reception too
 //   GET  /ei-hub/patient/:id               one child's EI Billing tab on the chart: Reception too
+//   POST /ei-hub/import/preview            EI-Hub's Child Info and Authorizations report: what it would change (Reception too)
+//   POST /ei-hub/import/apply              apply the ticked changes (lib/eiImport.js)
 //   GET  /ei-hub/claims?month=YYYY-MM       part 2: each EI session, its codes and what blocks a claim
 //   PUT  /ei-hub/claims/codes               change one session's codes (or back to the defaults)
 //   POST /ei-hub/claim-files                make an 837P file from chosen sessions
@@ -39,6 +42,19 @@ async function hasSetup(db) {
   if (r.rows[0]?.t && r.rows[0]?.h && r.rows[0]?.c === 2) ready = true;
   return ready;
 }
+
+// Authorization records and imports (migrations/2026-10-24_ei_authorizations.sql).
+let authReady = false;
+async function hasAuthTable(db) {
+  if (authReady) return true;
+  const r = await db.query(`SELECT to_regclass('"EiAuthorizations"') AS t`);
+  if (r.rows[0]?.t) authReady = true;
+  return authReady;
+}
+const AUTH_MIGRATION = 'Importing authorizations needs the 2026-10-24 database update. Ask an admin to run it.';
+// An authorization covering a date, and whether it's suspended then.
+const covers = (a, date) => (!a.start_date || history.day(a.start_date) <= date) && (!a.end_date || history.day(a.end_date) >= date);
+const suspendedOn = (a, date) => !!a.suspended_start && history.day(a.suspended_start) <= date && (!a.suspended_end || history.day(a.suspended_end) >= date);
 
 // Part 2's tables (migrations/2026-10-22_ei_claims.sql).
 let claimsReady = false;
@@ -131,7 +147,8 @@ async function claimData(db, month) {
     const pos = PLACE_OF_SERVICE[x.setting] || null;
     if (x.is_eval) problems.push("Evals aren't billed by file yet");
     if (!x.service) problems.push(x.service_options ? `Check the service (${x.service_options.join(' or ')})` : 'No service');
-    if (!x.authorization) problems.push('No auth #');
+    if (x.auth_problems && x.auth_problems.length) problems.push(...x.auth_problems);
+    else if (!x.authorization) problems.push('No auth #');
     if (!pos) problems.push('No room or offsite setting');
     problems.push(...childProblems(versions, patient, x.date));
     const referral = x.authorization ? history.versionOn(referralPeriods[x.authorization], x.date) : null;
@@ -148,6 +165,9 @@ async function claimData(db, month) {
       warnings.push(`${codes.length} line${codes.length === 1 ? '' : 's'} for a ${x.duration}-minute session`);
     }
     if (x.date < cutoff) warnings.push(`Over ${FILING_DAYS} days ago`);
+    if (x.auth_remaining !== null && x.auth_remaining !== undefined && x.auth_remaining <= 0 && !x.entered) {
+      warnings.push('EI-Hub showed no sessions left on this authorization at the last import');
+    }
     const charges = codes.length && pos ? splitCharge(visitRate(x.service, x.duration, pos), codes.length) : [];
     const claim = sent[x.key] || null;
     // One status per session, from first to last (Kieran, Oct 2026: one
@@ -254,7 +274,7 @@ const today = () => {
 
 // The patient chart's EI Billing tab: Reception, Admins and Developers.
 // Providers (staff) don't see EI billing information at all (Kieran, Oct 2026).
-async function chartRoutes({ path, method, db, currentUser }) {
+async function chartRoutes({ path, method, body, db, currentUser }) {
   const pm = path.match(/^\/ei-hub\/patient\/([^/]+)$/);
   if (pm && method === 'GET') {
     if (!canManage(currentUser)) return json(403, { error: 'EI billing details are only open to Reception, Admins and Developers.' });
@@ -269,17 +289,58 @@ async function chartRoutes({ path, method, db, currentUser }) {
     // Not EI (now): the chart's tab says so, but the patient form still gets
     // the child, for a patient being given EI in that same edit.
     const date = today();
+    // Authorizations imported from EI-Hub (lib/eiImport.js), newest first,
+    // each with its referring provider today.
+    const auths = (await hasAuthTable(db))
+      ? (await db.query('SELECT * FROM "EiAuthorizations" WHERE patient_id=$1 ORDER BY start_date DESC NULLS LAST', [child.id])).rows
+      : [];
+    const authPeriods = await history.versionsFor(db, 'referral', auths.map(a => a.authorization_number));
+    const authorizations = auths.map(a => {
+      const periods = authPeriods[a.authorization_number] || [];
+      return {
+        ...a, start_date: history.day(a.start_date), end_date: history.day(a.end_date),
+        suspended_start: history.day(a.suspended_start), suspended_end: history.day(a.suspended_end), last_session_date: history.day(a.last_session_date),
+        current: covers(a, date), suspended: suspendedOn(a, date),
+        referral: history.versionOn(periods, date) || periods.find(p => !p.end_date) || null,
+      };
+    });
     const services = child.services.map(s => {
       const problems = [];
-      if (!s.authorization_number) problems.push('No auth #');
-      else if (s.service !== 'SI' && !history.versionOn(s.referrals, date)) problems.push('No referring provider');
-      return { ...s, problems };
+      // An imported authorization covering today counts as the auth #.
+      const imported = authorizations.find(a => a.service === s.service && a.current);
+      const authNo = imported ? imported.authorization_number : s.authorization_number;
+      // Imported ones for this service, none covering today: EI-Hub would reject.
+      if (!imported && authorizations.some(a => a.service === s.service)) problems.push('No authorization covers today');
+      else if (!authNo) problems.push('No auth #');
+      else if (s.service !== 'SI' && !history.versionOn(authPeriods[authNo] || s.referrals, date)) problems.push('No referring provider');
+      if (imported && imported.suspended) problems.push('Authorization suspended');
+      return { ...s, authorization_number: authNo, referral: (authNo && history.versionOn(authPeriods[authNo] || s.referrals, date)) || null, problems };
     });
     const problems = childProblems(child.versions, child, date);
     if (!services.length) problems.push('No EI services in the mandate');
     return json(200, {
-      available: true, ei: isEi, child: { ...child, services, problems },
+      available: true, ei: isEi, child: { ...child, services, problems }, authorizations,
       can_edit: canManage(currentUser), counties: Object.keys(COUNTY_CODES).sort(),
+    });
+  }
+
+  // EI-Hub's Child Info and Authorizations report (lib/eiImport.js): see
+  // what it would change, then apply the ticked changes. Reception,
+  // Admins and Developers (Kieran, Oct 2026).
+  if ((path === '/ei-hub/import/preview' || path === '/ei-hub/import/apply') && method === 'POST') {
+    if (!canManage(currentUser)) return json(403, { error: 'Only Reception, Admins and Developers can import from EI-Hub.' });
+    if (!(await hasSetup(db))) return json(409, { error: MIGRATION });
+    const deps = { cleanChild, cleanReferral, mirrorChild, hasAuthTable: await hasAuthTable(db), authMigration: AUTH_MIGRATION };
+    if (path === '/ei-hub/import/preview') {
+      const p = await eiImport.preview(db, body, deps);
+      if (p.error) return json(400, { error: p.error });
+      return json(200, { ...eiImport.publicPreview(p), authorizations_available: deps.hasAuthTable });
+    }
+    const ids = Array.isArray(body?.ids) ? body.ids.map(String) : [];
+    return withClient(async (q) => {
+      const r = await eiImport.apply(q, body, ids, currentUser.username, deps);
+      if (r.error) return { status: 400, body: { error: r.error } };
+      return { status: 200, body: r };
     });
   }
 

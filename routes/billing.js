@@ -291,6 +291,15 @@ async function eiHubSessions(db, month) {
       .rows.forEach(e => { entries[e.session_key] = e; });
   }
 
+  // Authorizations imported from EI-Hub (lib/eiImport.js): when a child has
+  // any for a service, the one covering the session's date is its auth #
+  // (they change every few months; the mandate's auth # is the fallback).
+  const eiAuths = {};
+  if (await hasTable(db, 'EiAuthorizations') && patients.length) {
+    (await db.query('SELECT * FROM "EiAuthorizations" WHERE patient_id = ANY($1)', [patients.map(x => x.id)]))
+      .rows.forEach(x => { (eiAuths[x.patient_id] = eiAuths[x.patient_id] || []).push(x); });
+  }
+
   const sessions = [];
   for (const a of appts) {
     const date = day10(a.appointment_date);
@@ -298,8 +307,12 @@ async function eiHubSessions(db, month) {
     const services = specialty[a.provider] || [];
     const ei = eiServiceFor(history[p.id], date, services, p.Program);
     if (!ei) continue;
-    const { service, authorization, options: eiServices } = ei;
+    const { service, options: eiServices } = ei;
+    let { authorization } = ei;
     const unclear = !!eiServices;
+    const imported = service ? (eiAuths[p.id] || []).filter(x => x.service === service) : [];
+    const authRecord = imported.find(x => (!x.start_date || day10(x.start_date) <= date) && (!x.end_date || day10(x.end_date) >= date)) || null;
+    if (authRecord) authorization = authRecord.authorization_number;
     const startM = mins(a.appointment_time);
     const duration = Number(a.duration) || 30;
     const key = sessionKey(a);
@@ -307,7 +320,14 @@ async function eiHubSessions(db, month) {
     const problems = [];
     if (!p.ID_Number) problems.push('No ID # (EI child ID) on the patient');
     if (unclear) problems.push(`Check the service: ${a.provider} could have given ${eiServices.join(' or ')}`);
-    else if (!authorization) problems.push(`No EI authorization number for ${service || 'this service'} on this date`);
+    // What the imported EI-Hub authorizations say (also blocks a claim file;
+    // routes/eiHub.js claimData): EI-Hub rejects a session outside them.
+    const authProblems = [];
+    if (!unclear && imported.length && !authRecord) authProblems.push(`No ${service} authorization in EI-Hub covers this date`);
+    if (authRecord && authRecord.suspended_start && day10(authRecord.suspended_start) <= date
+      && (!authRecord.suspended_end || day10(authRecord.suspended_end) >= date)) authProblems.push('The authorization is suspended on this date');
+    if (!unclear && !authProblems.length && !authorization) problems.push(`No EI authorization number for ${service || 'this service'} on this date`);
+    problems.push(...authProblems);
     if (!setting) problems.push('No room or offsite setting');
     const e = entries[key];
     sessions.push({
@@ -323,6 +343,9 @@ async function eiHubSessions(db, month) {
       service,
       service_options: unclear ? eiServices : null,
       authorization,
+      // EI-Hub's count at the last import (null when not imported).
+      auth_problems: authProblems,
+      auth_remaining: authRecord && authRecord.sessions_remaining !== null ? Number(authRecord.sessions_remaining) : null,
       setting,
       is_makeup: !!a.is_makeup,
       is_eval: !!a.is_eval,
