@@ -323,6 +323,21 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // entirely is left out here (that's what /office-hours/closed-dates is
   // for) -- this only covers days the office is open but the provider
   // isn't contracted for all of it.
+  // A provider's contracted hours on one date ({ start_time, end_time }, or
+  // null when they aren't contracted that day). The appointment form warns
+  // when an Outside hours session falls inside them (Oct 2026).
+  if (path.match(/^\/providers\/[^/]+\/contracted-hours$/) && method === 'GET') {
+    const providerName = decodeURIComponent(path.split('/')[2]);
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(qs.date || '') ? qs.date : null;
+    if (!date) return json(400, { error: 'date (YYYY-MM-DD) is required.' });
+    const scheduleRes = await db.query('SELECT weekday, start_time, end_time FROM "ProviderUsualSchedule" WHERE provider=$1', [providerName]);
+    const scheduleByWeekday = Object.fromEntries(scheduleRes.rows.map(r => [r.weekday, r]));
+    const changes = (await loadChangesByProvider(db, { start: date, end: date, provider: providerName }))[providerName];
+    const hours = scheduleForDate(scheduleByWeekday, changes, date)[new Date(date + 'T00:00:00').getDay()];
+    if (!hours || !hours.start_time || !hours.end_time) return json(200, null);
+    return json(200, { start_time: String(hours.start_time).slice(0, 5), end_time: String(hours.end_time).slice(0, 5) });
+  }
+
   if (path.match(/^\/providers\/[^/]+\/contracted-gaps$/) && method === 'GET') {
     const providerName = decodeURIComponent(path.split('/')[2]);
     const { start, end } = qs;

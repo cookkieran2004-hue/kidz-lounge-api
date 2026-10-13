@@ -129,7 +129,9 @@ async function buildSheet(db, provider, month) {
   const markFor = (a) => {
     const date = String(a.appointment_date).slice(0, 10);
     // A closure is known in advance, so it shows even before the day ends.
-    if (closures[date]) return closures[date].type === 'emergency' ? 'Z' : 'H';
+    // An outside-hours session isn't affected by an office closure: it
+    // happened anyway, and counts as usual (Kieran, Oct 2026).
+    if (closures[date] && !a.outside_hours) return closures[date].type === 'emergency' ? 'Z' : 'H';
     // The same for an offsite session canceled for a holiday or emergency
     // closure there (Kieran, Oct 2026). 'other' or no reason stays A.
     // Both come before providerAbsent on purpose: H / Z wins over PA even
@@ -181,7 +183,7 @@ async function buildSheet(db, provider, month) {
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
     const letter = settingOf(a.treatment_area);
     if (letter) { row.settings.add(letter); row.setting = joinSettings(row.settings); }
-    (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id });
+    (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id, outside_hours: !!a.outside_hours });
   }
   // On the caseload with no sessions this month (booked later on): their program today.
   for (const name of names) {
@@ -295,7 +297,7 @@ async function eiHubSessions(db, month) {
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   const appts = apptsAll.filter(a => {
     const date = day10(a.appointment_date);
-    return date < today && !closed.has(date)
+    return date < today && (!closed.has(date) || a.outside_hours)
       && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
       && a.appointment_status !== 'Canceled' && a.appointment_status !== 'No Show'
       && !providerOut(a);

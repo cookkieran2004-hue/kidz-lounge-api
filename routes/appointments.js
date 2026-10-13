@@ -4,6 +4,10 @@ const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
 const { isHold } = require('../lib/caseload');
 const { applyCancelReason } = require('../lib/cancelReason');
+const { applyOutsideHours } = require('../lib/outsideHours');
+
+// Both per-session details, after any appointment row is written.
+const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyCancelReason(db, row, body), body, opts);
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).
@@ -50,6 +54,23 @@ async function handle(ctx) {
       if (m) out[m[2].trim().replace(/\s+/g, ' ').toLowerCase()] = m[1];
     }
     return json(200, out);
+  }
+
+  // A provider's outside-hours sessions in a month (My time): how many and
+  // how long. Canceled, No Show and HOLD don't count. Staff: their own
+  // linked provider only; Reception/Admin/Developer may pass ?provider=.
+  if (path === '/appointments/outside-hours' && method === 'GET') {
+    let provider = qs.provider;
+    if (!canManage(currentUser) || !provider) provider = currentUser.providerName;
+    if (!provider) return json(200, { provider: null, sessions: 0, hours: 0 });
+    const month = /^\d{4}-\d{2}$/.test(qs.month || '') ? qs.month : null;
+    if (!month) return json(400, { error: 'month (YYYY-MM) is required.' });
+    const [y, m] = month.split('-').map(Number);
+    const end = `${month}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}`;
+    const merged = await getMergedAppointments(db, { startDate: `${month}-01`, endDate: end, provider });
+    const counted = merged.filter(a => a.outside_hours && !['Canceled', 'No Show', '*HOLD*'].includes(a.appointment_status) && !isHold(a.patient_name));
+    const minutes = counted.reduce((t, a) => t + (Number(a.duration) || 30), 0);
+    return json(200, { provider, sessions: counted.length, hours: Math.round(minutes / 6) / 10 });
   }
 
   if (path === '/appointments/range' && method === 'GET') {
@@ -122,15 +143,15 @@ async function handle(ctx) {
     );
     if (makeupFor !== null) {
       const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
-      return json(201, await applyCancelReason(db, marked.rows[0], body));
+      return json(201, await applySessionDetails(db, marked.rows[0], body));
     }
     // An eval (booked from the patient chart; migrations/2026-10-19_evals.sql).
     if (body.is_eval === true) {
-      if (!(await hasEvalColumn(db))) return json(201, await applyCancelReason(db, result.rows[0], body));
+      if (!(await hasEvalColumn(db))) return json(201, await applySessionDetails(db, result.rows[0], body));
       const marked = await db.query('UPDATE "Appointments" SET is_eval=true WHERE id=$1 RETURNING *', [result.rows[0].id]);
-      return json(201, await applyCancelReason(db, marked.rows[0], body));
+      return json(201, await applySessionDetails(db, marked.rows[0], body));
     }
-    return json(201, await applyCancelReason(db, result.rows[0], body));
+    return json(201, await applySessionDetails(db, result.rows[0], body));
   }
 
   if (path.match(/^\/appointments\/[^/]+$/) && method === 'PUT') {
@@ -159,7 +180,7 @@ async function handle(ctx) {
         id,
       ]
     );
-    return json(200, await applyCancelReason(db, result.rows[0], body));
+    return json(200, await applySessionDetails(db, result.rows[0], body));
   }
 
   if (path.match(/^\/appointments\/[^/]+\/comments$/) && method === 'PUT') {
@@ -233,7 +254,7 @@ async function handle(ctx) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [patient_name, provider, weekday, appointment_time, duration || 30, treatment_area || null, appointment_status || 'Scheduled', start_date, end_date || null]
     );
-    return json(201, result.rows[0]);
+    return json(201, await applyOutsideHours(db, result.rows[0], body, { table: 'RecurringSeries' }));
   }
 
   // Ends a series at a given date (used for "edit this and all future" --
@@ -304,7 +325,8 @@ async function handle(ctx) {
         deleted || false,
       ]
     );
-    return json(201, await applyCancelReason(db, result.rows[0], body));
+    // An occurrence of an outside-hours series stays outside hours unless told otherwise.
+    return json(201, await applySessionDetails(db, result.rows[0], body, { fallback: !!series.outside_hours }));
   }
 
   // Marks an existing real exception row as deleted, rather than removing
