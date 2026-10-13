@@ -3,6 +3,7 @@ const { json } = require('../lib/http');
 const { canManage, canAdminister } = require('../lib/roles');
 const audit = require('../lib/audit');
 const pf = require('../lib/powerForms');
+const { PATIENT_TASK_FALLBACK_ROLES } = require('../lib/roles');
 
 // Power Forms (Kieran, Oct 2026; migrations/2026-10-27_power_forms.sql).
 // Staff (signed in):
@@ -18,6 +19,11 @@ const pf = require('../lib/powerForms');
 //   GET  /power-forms/requests/:id              answers + what they'd change on the chart
 //   POST /power-forms/requests/:id/apply        { fields: ['Parent_Phone', ...] }
 //   POST /power-forms/requests/:id/document     { document_id } the PDF copy saved to Documents
+//   POST /power-forms/requests/:id/review       mark a completed form reviewed
+// A completed form "needs review" until someone reviews it (or applies its
+// answers); submitting one gives every active Reception and Admin a review
+// task, completed for all of them when it's reviewed (Kieran, Oct 2026;
+// migrations/2026-10-28_power_forms_review.sql).
 // Public (the parent, no sign-in; index.js routes /forms/ here first):
 //   GET  /forms/:token                          is the link usable?
 //   POST /forms/:token/unlock                   { dob } -> the form + a 2-hour access token
@@ -40,6 +46,21 @@ async function hasTables(db) {
   return ready;
 }
 
+let reviewReady = false;
+async function hasReview(db) {
+  if (reviewReady) return true;
+  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'PowerFormRequests' AND column_name = 'reviewed_at'`);
+  if (r.rows.length) reviewReady = true;
+  return reviewReady;
+}
+const taskKey = (id) => `power_form_${id}`;
+// Done reviewing: the form is marked, and everyone's review task completes.
+async function markReviewed(db, id, username) {
+  if (!(await hasReview(db))) return;
+  await db.query('UPDATE "PowerFormRequests" SET reviewed_at=COALESCE(reviewed_at, now()), reviewed_by=COALESCE(reviewed_by, $1) WHERE id=$2', [username, id]);
+  await db.query(`UPDATE "Tasks" SET status='done', completed_at=now() WHERE deadline_type=$1 AND status <> 'done'`, [taskKey(id)]).catch(() => {});
+}
+
 // A request's status as people see it: sent / opened / completed /
 // cancelled / expired (sent or opened, past its date).
 function statusOf(r) {
@@ -51,6 +72,9 @@ const summaryOf = (r) => ({
   created_by: r.created_by, created_at: r.created_at, opened_at: r.opened_at, completed_at: r.completed_at,
   cancelled_by: r.cancelled_by, cancelled_at: r.cancelled_at, applied_by: r.applied_by, applied_at: r.applied_at,
   applied_fields: r.applied_fields, document_id: r.document_id, template_id: r.template_id,
+  reviewed_at: r.reviewed_at || null, reviewed_by: r.reviewed_by || null,
+  // Completed and not yet reviewed (only once the review columns exist).
+  needs_review: r.status === 'completed' && r.reviewed_at === null,
 });
 
 async function patientRow(db, id) {
@@ -192,7 +216,16 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       'UPDATE "PowerFormRequests" SET applied_by=$1, applied_at=now(), applied_fields=$2 WHERE id=$3 RETURNING *',
       [currentUser.username, JSON.stringify(applied), id]
     )).rows[0];
-    return json(200, { request: summaryOf(row), applied: usable.map(c => c.key) });
+    await markReviewed(db, id, currentUser.username);
+    const after = (await db.query('SELECT * FROM "PowerFormRequests" WHERE id=$1', [id])).rows[0];
+    return json(200, { request: summaryOf(after || row), applied: usable.map(c => c.key) });
+  }
+
+  if (action === 'review' && method === 'POST') {
+    if (r.status !== 'completed') return json(400, { error: 'The form hasn\'t been filled in yet.' });
+    if (!(await hasReview(db))) return json(409, { error: 'Marking forms reviewed needs the 2026-10-28 database update. Ask an admin to run it.' });
+    await markReviewed(db, id, currentUser.username);
+    return json(200, summaryOf((await db.query('SELECT * FROM "PowerFormRequests" WHERE id=$1', [id])).rows[0]));
   }
 
   if (action === 'document' && method === 'POST') {
@@ -279,6 +312,22 @@ async function handlePublic({ path, method, body, db, meta }) {
       [JSON.stringify(c.answers), meta.ip || null, r.id]
     )).rows[0];
     if (!done) return json(409, { error: 'This form was already submitted.' });
+    // A review task for every active Reception and Admin (never Developers,
+    // like the other patient tasks). Never blocks the parent's submission.
+    try {
+      const patient = (await db.query('SELECT "Name" FROM "Patients" WHERE id=$1', [r.patient_id])).rows[0];
+      const staff = (await db.query('SELECT username FROM "Staff" WHERE archived=false AND role = ANY($1)', [PATIENT_TASK_FALLBACK_ROLES])).rows;
+      for (const s of staff) {
+        await db.query(
+          `INSERT INTO "Tasks" (title, description, assigned_to, assigned_by, status, is_automated, related_patient_id, deadline_type, deadline_date, due_date)
+           VALUES ($1, $2, $3, 'system', 'open', true, $4, $5, CURRENT_DATE, CURRENT_DATE)`,
+          [`Review Power Form: ${r.form_name}`, `${patient ? patient.Name : 'A patient'}'s family completed "${r.form_name}". Open their chart, Power Forms, to review it.`,
+            s.username, r.patient_id, taskKey(r.id)]
+        );
+      }
+    } catch (err) {
+      console.error('Power Form review tasks not created', err);
+    }
     // HIPAA audit log: a submission from outside (no staff account).
     await audit.record(db, {
       username: null, role: 'parent', action: 'create', resource: 'Power Form submission', patientId: r.patient_id,

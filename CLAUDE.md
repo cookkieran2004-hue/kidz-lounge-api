@@ -155,6 +155,7 @@ Show the results before shipping.
 - The link token is 32 random bytes (base64url); only `sha256` is stored, so a link is shown once and **New link** replaces it. A request copies the template's name / intro / fields when sent. Status: sent / opened / completed / cancelled, and "expired" is computed (`statusOf`).
 - Answers linked to chart fields (`CHART_FIELDS`) are **never saved on their own**: `GET /power-forms/requests/:id` returns `changes` (old vs new) and `POST .../apply { fields }` writes the ticked ones to `Patients` (Kieran: staff review first). Audited as "patient (from Power Form)".
 - The PDF copy is made in the browser and uploaded through the normal document upload, then linked with `POST .../document`.
+- **Review** (migration `2026-10-28_power_forms_review.sql`, `reviewed_at` / `reviewed_by`): a completed form has `needs_review` until someone applies its changes or `POST .../review` ("Mark as reviewed"; 409 before the migration). On submit, every active Reception and Admin (`PATIENT_TASK_FALLBACK_ROLES`, never Developers) gets a task "Review Power Form: <form>" with `deadline_type` `power_form_<id>`; `markReviewed` completes them all. Making the tasks never blocks the parent's submission.
 
 ## Patient programs and mandates (Oct 2026)
 
