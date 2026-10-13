@@ -103,15 +103,30 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
 
 ## Migrations
 
-- `migrations/YYYY-MM-DD_description.sql`. They must be idempotent (`IF NOT EXISTS`, "safe to run more than once").
-- **Claude has no DB credentials.** Kieran runs them from `../kidz-lounge-scripts`:
-  ```
-  node run_sql_file.js ../kidz-lounge-api/migrations/<file>.sql
-  ```
-  with `DB_*` exported, using the values from the Lambda's environment variables. Give him the exact commands, plus a `node -e` check query to confirm the result.
+- `migrations/YYYY-MM-DD_description.sql` (lowercase, digits and `_` only). Keep them idempotent (`IF NOT EXISTS`) anyway.
+- **The migration runner** (`lib/migrations.js`, Oct 2026) runs files the database hasn't had, in filename order, each in its own transaction, and records them in `SchemaMigrations` (filename, checksum, `ran` or `marked`). It's the Lambda job `{"source":"deploy","job":"migrate"}` (`"dryRun": true` lists what would run). It stops at the first failure, and it reports a recorded file whose text changed but never re-runs it.
+  - **No `BEGIN;` / `COMMIT;` in a migration file.** The runner refuses one, because it wraps each file itself. (`BEGIN` inside a `DO $$` block is fine.)
+  - **One-time data fixes go in `../kidz-lounge-scripts`, never in `migrations/`.** Every new clinic database would run them.
+  - A database the runner has never seen refuses to run until the files already in effect are recorded without running: `"markExistingUpTo": "<last file it has>"`. This protects `2026-10-05_clear_salaried_pto.sql` (zeroes salaried PTO) from running again.
+  - **Claude has no DB credentials.** Kieran runs the job after the API deploy (the release pipeline will do it later):
+    ```
+    aws lambda invoke --profile kl-prod --function-name kidz-lounge-api \
+      --cli-binary-format raw-in-base64-out --payload '{"source":"deploy","job":"migrate"}' /dev/stdout
+    ```
+  - Before the runner is set up on a database, migrations were run by hand with `node run_sql_file.js ../kidz-lounge-api/migrations/<file>.sql` from `../kidz-lounge-scripts`.
 - One-off data scripts go in `../kidz-lounge-scripts`. They require the API's `lib/` modules, run in **one transaction**, **dry-run by default** (print a `console.table` and roll back), and only commit with `--apply`. Guard against double runs.
 - Code must keep working before its migration has been run: check whether the table or column exists and degrade gracefully. Cache only a **positive** result (see `hasLedgerTable`, `hasChargedColumn`), so a warm Lambda picks up the migration once it's run. The older helpers (`hasColumn`, `hasChangesTable`) cache "no" as well.
-- The base schema isn't in the repo. Migrations only cover changes from 2026-09-25 onward.
+- The base schema is `../clinic-platform/schema/baseline.sql`: structure only, no rows, exported from production on 2026-10-13 with all 36 migrations through `2026-10-31_staff_dob.sql` in effect. `pg_dump` 18 adds `\restrict` / `\unrestrict` lines that only `psql` understands, so strip them before running the file any other way.
+
+## Generic-ready code (white-label groundwork, Oct 2026)
+
+Kieran plans to deploy this API for other pediatric therapy clinics, one deployment each (plan: "White-label plan" doc). Until that's built, new code mustn't add more Kidz Lounge-specific details:
+
+- **Every schema change is a dated file in `migrations/`,** never only in `../kidz-lounge-scripts` (that folder is for one-off data fixes). A fresh database must eventually be buildable from this repo.
+- **Clinic time:** use `clinicToday()` from `lib/caseload.js`. Never write `America/New_York` again (four older copies remain).
+- **Clinic policy numbers** (lead days, limits, rates) are named constants at the top of their `lib/` file, never inline.
+- **No AWS region, account or bucket names in code.** Read them from environment variables.
+- **Never type the clinic's name in new messages.** Say "the office" or similar. Older mentions stay until the generic version is built.
 
 ## Testing
 

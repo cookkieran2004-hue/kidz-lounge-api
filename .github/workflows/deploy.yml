@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p dist
           cp index.js package.json package-lock.json dist/
-          cp -r lib routes dist/
+          cp -r lib routes migrations dist/
           npm ci --omit=dev --prefix dist
 
       - name: Configure AWS credentials

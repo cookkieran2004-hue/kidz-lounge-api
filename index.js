@@ -20,6 +20,7 @@ const { JWT_SECRET, handleLogin, handleSetPassword } = require('./lib/auth');
 const { runComplianceCheck } = require('./lib/complianceCheck');
 const { runTimeOffAccrual } = require('./lib/timeOffAccrual');
 const { runWeeklyPtoAccrual } = require('./lib/ptoAccrual');
+const { runMigrations } = require('./lib/migrations');
 
 const staffRoutes = require('./routes/staff');
 const providerRoutes = require('./routes/providers');
@@ -63,6 +64,15 @@ function scheduledJobFor(event) {
 exports.scheduledJobFor = scheduledJobFor;
 
 async function handleRequest(event) {
+  // Database migrations, invoked directly by the deploy pipeline or by hand
+  // (`aws lambda invoke`; see lib/migrations.js). API Gateway can't set a
+  // top-level `source`, so a browser can never reach this.
+  if (event.source === 'deploy' && event.job === 'migrate') {
+    const result = await runMigrations(getPool(), { dryRun: event.dryRun === true, markExistingUpTo: event.markExistingUpTo || null });
+    console.log('Migrations:', JSON.stringify(result));
+    return { statusCode: result.ok ? 200 : 500, body: JSON.stringify(result) };
+  }
+
   // EventBridge scheduled trigger for the 72-hour chat cleanup job -- not an
   // HTTP request at all, so it's handled completely separately, before any
   // of the API Gateway-shaped routing below even looks at the event.
