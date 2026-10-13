@@ -22,7 +22,7 @@ const { PATIENT_TASK_FALLBACK_ROLES } = require('../lib/roles');
 //                                               -> the link's token (once). Several forms = one link for all of them
 //                                               (a "packet", migrations/2026-10-29_power_form_packages.sql).
 //   POST /power-forms/requests/:id/new-link     a fresh link (the old one stops working)
-//   POST /power-forms/requests/:id/cancel
+//   POST /power-forms/requests/:id/cancel       removes a form not filled in yet
 //   GET  /power-forms/requests/:id              answers + what they'd change on the chart
 //   POST /power-forms/requests/:id/apply        { fields: ['Parent_Phone', ...] }
 //   POST /power-forms/requests/:id/document     { document_id } the PDF copy saved to Documents
@@ -118,6 +118,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, {
       available: await hasTables(db), types: pf.TYPES,
       chart_fields: Object.fromEntries(Object.entries(pf.CHART_FIELDS).map(([k, v]) => [k, { label: v.label, types: v.types }])),
+      prefill: pf.PREFILL,
       days: DAYS, can_build: canAdminister(currentUser), packages_available: await hasPackets(db),
     });
   }
@@ -304,13 +305,17 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, { request: summaryOf(row), token });
   }
 
+  // Cancelling a form not filled in yet removes it from the chart (Kieran,
+  // Oct 2026: "no need to keep"); its link stops working. The audit log
+  // keeps the record of it.
   if (action === 'cancel' && method === 'POST') {
     if (r.status === 'completed') return json(400, { error: 'This form is already filled in.' });
-    const row = (await db.query(
-      `UPDATE "PowerFormRequests" SET status='cancelled', cancelled_by=$1, cancelled_at=now() WHERE id=$2 RETURNING *`,
-      [currentUser.username, id]
-    )).rows[0];
-    return json(200, summaryOf(row));
+    await db.query('DELETE FROM "PowerFormRequests" WHERE id=$1', [id]);
+    if (r.packet_id) {
+      await closePacketTask(db, r.packet_id);
+      await db.query('DELETE FROM "PowerFormPackets" WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM "PowerFormRequests" WHERE packet_id=$1)', [r.packet_id]);
+    }
+    return json(200, { deleted: true });
   }
 
   if (action === 'apply' && method === 'POST') {
@@ -456,7 +461,7 @@ async function handlePublic({ path, method, body, db, meta }) {
 
   if (m[2] === 'unlock' && method === 'POST') {
     const dob = String(b.dob || '').slice(0, 10);
-    const patient = (await db.query('SELECT "Name", "Date_of_Birth" FROM "Patients" WHERE id=$1', [link.patient_id])).rows[0];
+    const patient = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [link.patient_id])).rows[0];
     const real = patient && patient.Date_of_Birth ? String(patient.Date_of_Birth).slice(0, 10) : null;
     if (!real || dob !== real) {
       // The 5th wrong try in a row locks the link for 30 minutes and starts the count again.
@@ -472,13 +477,17 @@ async function handlePublic({ path, method, body, db, meta }) {
       return json(400, { error: "That date of birth doesn't match our records. Please check it and try again." });
     }
     const child_first_name = String(patient.Name || '').trim().split(/\s+/)[0] || null;
+    // The form is labelled with who it's for, like a chart label, and the
+    // patient's saved details are filled in (only now the DOB matched).
+    const label = { name: patient.Name, dob: real, id_number: patient.ID_Number || null };
+    const fill = (fields) => pf.withPatient(fields, patient);
     if (kind === 'packet') {
       await db.query('UPDATE "PowerFormPackets" SET failed_checks=0, opened_at=COALESCE(opened_at, now()) WHERE id=$1', [link.id]);
       await db.query(`UPDATE "PowerFormRequests" SET opened_at=COALESCE(opened_at, now()), status='opened' WHERE packet_id=$1 AND status='sent'`, [link.id]);
       const access = jwt.sign({ pid: link.id }, accessSecret(), { expiresIn: '2h' });
       return json(200, {
-        access, packet: true, form_name: link.name, child_first_name,
-        forms: found.forms.map(f => ({ id: f.id, form_name: f.form_name, intro: f.intro, fields: f.fields, status: f.status === 'completed' ? 'completed' : 'open' })),
+        access, packet: true, form_name: link.name, child_first_name, label,
+        forms: found.forms.map(f => ({ id: f.id, form_name: f.form_name, intro: f.intro, fields: fill(f.fields), status: f.status === 'completed' ? 'completed' : 'open' })),
       });
     }
     await db.query(
@@ -486,7 +495,7 @@ async function handlePublic({ path, method, body, db, meta }) {
       [link.id]
     );
     const access = jwt.sign({ rid: link.id }, accessSecret(), { expiresIn: '2h' });
-    return json(200, { access, form_name: link.form_name, intro: link.intro, fields: link.fields, child_first_name });
+    return json(200, { access, form_name: link.form_name, intro: link.intro, fields: fill(link.fields), child_first_name, label });
   }
 
   if (m[2] === 'submit' && method === 'POST') {
