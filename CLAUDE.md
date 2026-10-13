@@ -4,6 +4,8 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
 
 ## Commands
 
+- The repos live under **github.com/kieran04289** (moved from cookkieran2004-hue, Oct 2026). Both AWS deploy roles accept either account until the old one is removed (clinic-platform `docs/05-transfer-repos.md`, step 9).
+
 - No build, test, or lint setup. Plain CommonJS on Node 22 (the Lambda runtime is Node.js 22.x; keep it and `node-version` in `.github/workflows/deploy.yml` in step). Check that a change loads with `node -e "require('./index.js')"`.
 - Deploy (Oct 13 2026): pushing to `main` runs `.github/workflows/deploy.yml`, which deploys to the **Demo** clinic's Lambda (`vars.DEMO_ROLE_ARN`, `vars.DEMO_FUNCTION_NAME`). Kidz Lounge gets `main` at **11 PM New York time** from `release.yml` (`vars.AWS_ROLE_ARN`, `vars.LAMBDA_FUNCTION_NAME`), which then moves the `production` branch to what it released. Both use `lambda-deploy.yml`: copy `index.js`, `lib/`, `routes/`, `migrations/` and the package files into `dist/`, `npm ci --omit=dev`, deploy through OIDC, wait for the new code, then run the migrate job (a failed migration fails the run). Urgent fix: run "Nightly release to Kidz Lounge" by hand from Actions. Watch runs with `curl -s "https://api.github.com/repos/kieran04289/kidz-lounge-api/actions/runs?per_page=5"` (the `gh` CLI isn't installed).
 - A new top-level file or folder is not deployed unless you add it to the "Package function" step in `lambda-deploy.yml`. New files under `lib/` or `routes/` are picked up automatically.
