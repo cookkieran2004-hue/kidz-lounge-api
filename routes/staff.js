@@ -1,4 +1,5 @@
 const bcrypt = require('bcryptjs');
+const { syncRequiredTask } = require('../lib/credentialTypes');
 const { canManage, canAdminister, canCaseManage, ROLES } = require('../lib/roles');
 
 // Whether a credential may have no expiration date yet
@@ -110,6 +111,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       `INSERT INTO "StaffCredentials" (username, credential_name, expiration_date, notes) VALUES ($1,$2,$3,$4) RETURNING *`,
       [who, credential_name.trim(), expiration_date || null, notes || null]
     );
+    await syncRequiredTask(db, who);
     return json(201, result.rows[0]);
   }
 
@@ -133,6 +135,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$4 RETURNING *`,
       [credential_name || null, expiration_date || null, notes ?? null, id, clearExpiry]
     );
+    await syncRequiredTask(db, existing.rows[0].username);
     return json(200, result.rows[0]);
   }
 
@@ -144,6 +147,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       return json(403, { error: 'You can only delete your own credentials.' });
     }
     await db.query('DELETE FROM "StaffCredentials" WHERE id=$1', [id]);
+    await syncRequiredTask(db, existing.rows[0].username);
     return json(200, { deleted: true });
   }
 
