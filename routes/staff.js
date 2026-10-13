@@ -1,5 +1,17 @@
 const bcrypt = require('bcryptjs');
 const { canManage, canAdminister, canCaseManage, ROLES } = require('../lib/roles');
+
+// Whether a credential may have no expiration date yet
+// (migrations/2026-10-26_credentials_optional_expiry.sql). Only "yes" is
+// cached, so a warm Lambda picks the migration up once it's run.
+let expiryOptionalSeen = false;
+async function expiryOptional(db) {
+  if (expiryOptionalSeen) return true;
+  const r = await db.query(`SELECT is_nullable FROM information_schema.columns WHERE table_name = 'StaffCredentials' AND column_name = 'expiration_date'`);
+  if (r.rows[0]?.is_nullable === 'YES') expiryOptionalSeen = true;
+  return expiryOptionalSeen;
+}
+const NEEDS_UPDATE = 'Credentials without an expiration date need the 2026-10-26 database update. Ask an admin to run it, or add a date for now.';
 const { EMPLOYMENT_TYPES, hasEmploymentColumn } = require('../lib/employment');
 
 // Sets employment_type when the request includes a valid one (and the
@@ -81,7 +93,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const who = qs.username && qs.username !== currentUser.username ? qs.username : currentUser.username;
     if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
-      `SELECT * FROM "StaffCredentials" WHERE username=$1 ORDER BY expiration_date ASC`,
+      `SELECT * FROM "StaffCredentials" WHERE username=$1 ORDER BY expiration_date ASC NULLS LAST`,
       [who]
     );
     return json(200, result.rows);
@@ -92,10 +104,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const who = body.username && body.username !== currentUser.username ? body.username : currentUser.username;
     if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
     if (!credential_name || !credential_name.trim()) return json(400, { error: 'Credential name is required.' });
-    if (!expiration_date) return json(400, { error: 'Expiration date is required.' });
+    // The expiration date is optional (some credentials never expire).
+    if (!expiration_date && !(await expiryOptional(db))) return json(400, { error: NEEDS_UPDATE });
     const result = await db.query(
       `INSERT INTO "StaffCredentials" (username, credential_name, expiration_date, notes) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [who, credential_name.trim(), expiration_date, notes || null]
+      [who, credential_name.trim(), expiration_date || null, notes || null]
     );
     return json(201, result.rows[0]);
   }
@@ -108,14 +121,17 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       return json(403, { error: 'You can only edit your own credentials.' });
     }
     const { credential_name, expiration_date, notes } = body;
+    // Sent empty, the expiration date is cleared (no expiry); left out, it's kept.
+    const clearExpiry = Object.prototype.hasOwnProperty.call(body, 'expiration_date') && !expiration_date;
+    if (clearExpiry && !(await expiryOptional(db))) return json(400, { error: NEEDS_UPDATE });
     const result = await db.query(
       `UPDATE "StaffCredentials" SET
          credential_name = COALESCE($1, credential_name),
-         expiration_date = COALESCE($2, expiration_date),
+         expiration_date = CASE WHEN $5 THEN NULL ELSE COALESCE($2, expiration_date) END,
          notes = COALESCE($3, notes),
          updated_at = now()
        WHERE id=$4 RETURNING *`,
-      [credential_name || null, expiration_date || null, notes ?? null, id]
+      [credential_name || null, expiration_date || null, notes ?? null, id, clearExpiry]
     );
     return json(200, result.rows[0]);
   }
