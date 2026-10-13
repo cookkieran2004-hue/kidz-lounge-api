@@ -151,7 +151,7 @@ Show the results before shipping.
 
 ## Required credentials (Oct 2026)
 
-- `lib/credentialTypes.js`: the owner's list (Physical, License/Registration, Liability Insurance, Mandated Reporter, OSHA Training, SCR, Trainings), matched without case/spaces/punctuation plus a few older spellings. `syncRequiredTask(db, username)` opens one "Enter your credentials" task (`deadline_type` `credentials_required`) for a provider (Staff.provider_name set) missing any, and closes it once all are on file; called after every credential add/edit/delete in `routes/staff.js` and for every provider in the daily compliance check. Expiration dates stay typed in and optional (never calculated).
+- `lib/credentialTypes.js`: the owner's list (Physical, License/Registration, Liability Insurance, Mandated Reporter, OSHA Training, SCR, Trainings, License Number, NPI Number), matched without case/spaces/punctuation plus a few older spellings. `syncRequiredTask(db, username)` opens one "Enter your credentials" task (`deadline_type` `credentials_required`) for a provider (Staff.provider_name set) missing any, and closes it once all are on file; called after every credential add/edit/delete in `routes/staff.js` and for every provider in the daily compliance check. Expiration dates stay typed in and optional (never calculated).
 
 ## Power Forms (Oct 2026)
 
