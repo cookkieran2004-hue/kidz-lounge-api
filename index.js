@@ -36,6 +36,7 @@ const waitlistRoutes = require('./routes/waitlist');
 const auditLogRoutes = require('./routes/auditLog');
 const billingRoutes = require('./routes/billing');
 const eiHubRoutes = require('./routes/eiHub');
+const powerFormRoutes = require('./routes/powerForms');
 const audit = require('./lib/audit');
 
 // Tried in this order for every authenticated request; the first module to
@@ -44,7 +45,7 @@ const audit = require('./lib/audit');
 // but grouping stays roughly domain-by-domain for readability.
 const ROUTE_MODULES = [
   staffRoutes, providerRoutes, patientRoutes, appointmentRoutes,
-  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes,
+  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes, powerFormRoutes,
 ];
 
 // Which scheduled job an EventBridge event is for: its `job` (a rule with a
@@ -139,6 +140,14 @@ async function handleRequest(event) {
         db, body, currentUser,
         ip: event.requestContext?.http?.sourceIp || event.requestContext?.identity?.sourceIp || null,
       });
+    }
+
+    // Power Forms: a parent opens and submits a form from a secure link, no
+    // sign-in (routes/powerForms.js handlePublic; unlocked with the child's
+    // date of birth).
+    if (path.startsWith('/forms/')) {
+      const formResult = await powerFormRoutes.handlePublic({ path, method, body, db, meta: audit.requestMeta(event) });
+      if (formResult) return formResult;
     }
 
     if (!currentUser) {
