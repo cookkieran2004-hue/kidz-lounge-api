@@ -48,6 +48,9 @@ jobs:
         with:
           function-name: ${{ inputs.function-name }}
           code-artifacts-dir: ./dist
+          # The action sets the runtime on every deploy and defaults to
+          # nodejs20.x (out of support since April 2026), so it's named here.
+          runtime: nodejs22.x
 
       - name: Wait for the new code to be live
         run: aws lambda wait function-updated-v2 --function-name "$FN"
