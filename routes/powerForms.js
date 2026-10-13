@@ -361,7 +361,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
 // ---------- Public: the parent's side ----------
 const accessSecret = () => `${process.env.JWT_SECRET}:power-forms`;
-const NOT_VALID = "This link isn't valid. Ask Kidz Lounge to send you a new one.";
+const NOT_VALID = "This link isn't valid. Ask the office to send you a new one.";
 
 // A link is either one form (PowerFormRequests.token_hash) or a packet of
 // forms (PowerFormPackets.token_hash). -> { kind: 'form', link: request }
@@ -391,8 +391,8 @@ function blocked(found) {
     s = statusOf(link);
   }
   if (s === 'completed') return { status: 200, body: { status: 'completed', form_name: name } };
-  if (s === 'cancelled') return { status: 410, body: { status: 'cancelled', error: 'This form is no longer needed. If you think that\'s a mistake, contact Kidz Lounge.' } };
-  if (s === 'expired') return { status: 410, body: { status: 'expired', error: 'This link has expired. Ask Kidz Lounge to send you a new one.' } };
+  if (s === 'cancelled') return { status: 410, body: { status: 'cancelled', error: 'This form is no longer needed. If you think that\'s a mistake, contact the office.' } };
+  if (s === 'expired') return { status: 410, body: { status: 'expired', error: 'This link has expired. Ask the office to send you a new one.' } };
   if (link.locked_until && new Date(link.locked_until) > new Date()) {
     const mins = Math.max(1, Math.ceil((new Date(link.locked_until) - new Date()) / 60000));
     return { status: 429, body: { status: 'locked', error: `Too many tries. Please try again in ${mins} minute${mins === 1 ? '' : 's'}.` } };

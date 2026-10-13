@@ -416,7 +416,7 @@ async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
       // KL + date + file id: never repeats, and can't collide with invoice
       // numbers typed into EI-Hub by hand.
       const invoice = `KL${stamp}${String(file.id).padStart(5, '0')}`;
-      const fileName = `KidzLounge_837P_${invoice}${test ? '_TEST' : ''}.txt`;
+      const fileName = `837P_${invoice}${test ? '_TEST' : ''}.txt`;
       const claims = chosen.map((r, i) => ({
         claim_number: `KL${String(file.id).padStart(6, '0')}${String(i + 1).padStart(4, '0')}${test ? 'T' : ''}`,
         ...r._build,

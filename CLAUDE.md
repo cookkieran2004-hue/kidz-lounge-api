@@ -5,8 +5,8 @@ Backend for Kidz Lounge, a staff-only scheduling and patient-management app for 
 ## Commands
 
 - No build, test, or lint setup. Plain CommonJS on Node 22 (the Lambda runtime is Node.js 22.x; keep it and `node-version` in `.github/workflows/deploy.yml` in step). Check that a change loads with `node -e "require('./index.js')"`.
-- Deploy: pushing to `main` runs `.github/workflows/deploy.yml`, which copies `index.js`, `lib/`, `routes/` and the package files into `dist/`, runs `npm ci --omit=dev`, and deploys to Lambda through OIDC. **Pushing to main is a production deploy.** Watch the result with `curl -s "https://api.github.com/repos/cookkieran2004-hue/kidz-lounge-api/actions/runs?per_page=5"` (the `gh` CLI isn't installed).
-- A new top-level file or folder is not deployed unless you add it to the workflow's "Package function" step. New files under `lib/` or `routes/` are picked up automatically.
+- Deploy (Oct 13 2026): pushing to `main` runs `.github/workflows/deploy.yml`, which deploys to the **Demo** clinic's Lambda (`vars.DEMO_ROLE_ARN`, `vars.DEMO_FUNCTION_NAME`). Kidz Lounge gets `main` at **11 PM New York time** from `release.yml` (`vars.AWS_ROLE_ARN`, `vars.LAMBDA_FUNCTION_NAME`), which then moves the `production` branch to what it released. Both use `lambda-deploy.yml`: copy `index.js`, `lib/`, `routes/`, `migrations/` and the package files into `dist/`, `npm ci --omit=dev`, deploy through OIDC, wait for the new code, then run the migrate job (a failed migration fails the run). Urgent fix: run "Nightly release to Kidz Lounge" by hand from Actions. Watch runs with `curl -s "https://api.github.com/repos/cookkieran2004-hue/kidz-lounge-api/actions/runs?per_page=5"` (the `gh` CLI isn't installed).
+- A new top-level file or folder is not deployed unless you add it to the "Package function" step in `lambda-deploy.yml`. New files under `lib/` or `routes/` are picked up automatically.
 - `node_modules/` is committed and there's no `.gitignore`. The deploy runs its own `npm ci`, so the committed copy isn't used.
 
 ## Architecture
@@ -108,7 +108,7 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - **No `BEGIN;` / `COMMIT;` in a migration file.** The runner refuses one, because it wraps each file itself. (`BEGIN` inside a `DO $$` block is fine.)
   - **One-time data fixes go in `../kidz-lounge-scripts`, never in `migrations/`.** Every new clinic database would run them.
   - A database the runner has never seen refuses to run until the files already in effect are recorded without running: `"markExistingUpTo": "<last file it has>"`. This protects `2026-10-05_clear_salaried_pto.sql` (zeroes salaried PTO) from running again.
-  - **Claude has no DB credentials.** Kieran runs the job after the API deploy (the release pipeline will do it later):
+  - **The deploy workflows run it** after every deploy (Demo on push, Kidz Lounge at 11 PM). To run it by hand:
     ```
     aws lambda invoke --profile kl-prod --function-name kidz-lounge-api \
       --cli-binary-format raw-in-base64-out --payload '{"source":"deploy","job":"migrate"}' /dev/stdout

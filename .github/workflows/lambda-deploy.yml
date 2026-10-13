@@ -1,0 +1,61 @@
+name: Deploy Lambda (shared steps)
+
+# Used by deploy.yml (Demo, on every push to main) and release.yml (Kidz
+# Lounge, nightly). Packages the API, deploys it to one clinic's Lambda, waits
+# for the new code, then runs any new database migrations there.
+on:
+  workflow_call:
+    inputs:
+      role-arn:
+        required: true
+        type: string
+      function-name:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for OIDC authentication
+      contents: read  # Required to check out the repository
+    env:
+      FN: ${{ inputs.function-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # No build step: bundle the handler, its source, migrations and production deps.
+      - name: Package function
+        run: |
+          mkdir -p dist
+          cp index.js package.json package-lock.json dist/
+          cp -r lib routes migrations dist/
+          npm ci --omit=dev --prefix dist
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy Lambda Function
+        uses: aws-actions/aws-lambda-deploy@v1
+        with:
+          function-name: ${{ inputs.function-name }}
+          code-artifacts-dir: ./dist
+
+      - name: Wait for the new code to be live
+        run: aws lambda wait function-updated-v2 --function-name "$FN"
+
+      # lib/migrations.js: runs files in migrations/ this database hasn't had.
+      - name: Run new database migrations
+        run: |
+          aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out \
+            --payload '{"source":"deploy","job":"migrate"}' migrate.json > /dev/null
+          cat migrate.json; echo
+          grep -q '"statusCode":200' migrate.json || { echo "::error::The migration run reported a problem (see above)."; exit 1; }

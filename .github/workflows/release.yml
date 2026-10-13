@@ -1,0 +1,67 @@
+name: Nightly release to Kidz Lounge
+
+# At 11 PM New York time, whatever is on main (already running on Demo) goes
+# to Kidz Lounge: code, then migrations. The `production` branch marks what
+# Kidz Lounge is running, so a night with nothing new does nothing. The
+# frontend's own release runs at 11:30 PM and waits for this one to succeed.
+#
+# GitHub schedules are in UTC, so there are two: only the one that lands on
+# 11 PM in New York (summer or winter time) goes ahead.
+# "Run workflow" on this workflow's Actions page = release now (urgent fixes).
+on:
+  schedule:
+    - cron: '0 3 * * *' # 11 PM EDT (summer)
+    - cron: '0 4 * * *' # 11 PM EST (winter)
+  workflow_dispatch:
+
+concurrency:
+  group: release-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            zone=$(TZ=America/New_York date +%Z)
+            case "${{ github.event.schedule }}/$zone" in
+              "0 3 * * */EDT"|"0 4 * * */EST") ;;
+              *) echo "Not 11 PM in New York ($zone); the other schedule handles tonight."; echo go=false >> "$GITHUB_OUTPUT"; exit 0 ;;
+            esac
+          fi
+          if git rev-parse -q --verify origin/production > /dev/null && [ "$(git rev-parse origin/production)" = "$(git rev-parse HEAD)" ]; then
+            echo "Nothing new since the last release."; echo go=false >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "Releasing $(git rev-parse --short HEAD) to Kidz Lounge."
+          echo go=true >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: check
+    if: needs.check.outputs.go == 'true'
+    uses: ./.github/workflows/lambda-deploy.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      role-arn: ${{ vars.AWS_ROLE_ARN }}
+      function-name: ${{ vars.LAMBDA_FUNCTION_NAME }}
+
+  # Only after a successful deploy and migration run.
+  mark-released:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git push origin "${{ github.sha }}:refs/heads/production"
