@@ -12,6 +12,8 @@ async function expiryOptional(db) {
   if (r.rows[0]?.is_nullable === 'YES') expiryOptionalSeen = true;
   return expiryOptionalSeen;
 }
+// Other people's credentials: Reception, Admin and Developer (canManage).
+const CREDENTIALS_DENIED = 'Only Reception, Admins and Developers can see or change other people\'s credentials.';
 const NEEDS_UPDATE = 'Credentials without an expiration date need the 2026-10-26 database update. Ask an admin to run it, or add a date for now.';
 const { EMPLOYMENT_TYPES, hasEmploymentColumn } = require('../lib/employment');
 
@@ -105,11 +107,29 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, result.rows[0]);
   }
 
-  // Your own credentials -- or, for an Admin / Developer, anyone's
-  // (?username= / body.username, from their staff profile).
+  // Every active staff member with their credentials, providers first: the
+  // Credentials page (Reception, Admin, Developer; Kieran, Oct 2026).
+  if (path === '/credentials/overview' && method === 'GET') {
+    if (!canManage(currentUser)) return json(403, { error: CREDENTIALS_DENIED });
+    const [staffRes, credsRes] = await Promise.all([
+      db.query('SELECT username, first_name, middle_name, last_name, preferred_name, role, provider_name, position FROM "Staff" WHERE archived = false'),
+      db.query(`SELECT c.* FROM "StaffCredentials" c JOIN "Staff" s ON s.username = c.username AND s.archived = false
+                ORDER BY c.expiration_date ASC NULLS LAST`),
+    ]);
+    const byUser = {};
+    for (const c of credsRes.rows) (byUser[c.username] = byUser[c.username] || []).push(c);
+    const staff = staffRes.rows.map(s => ({
+      username: s.username, name: displayNameFor(s), role: s.role, position: s.position || null,
+      is_provider: !!s.provider_name, credentials: byUser[s.username] || [],
+    })).sort((a, b) => (b.is_provider - a.is_provider) || a.name.localeCompare(b.name));
+    return json(200, { staff });
+  }
+
+  // Your own credentials -- or, for Reception / Admin / Developer, anyone's
+  // (?username= / body.username: staff profiles and the Credentials page).
   if (path === '/staff/credentials' && method === 'GET') {
     const who = qs.username && qs.username !== currentUser.username ? qs.username : currentUser.username;
-    if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    if (who !== currentUser.username && !canManage(currentUser)) return json(403, { error: CREDENTIALS_DENIED });
     const result = await db.query(
       `SELECT * FROM "StaffCredentials" WHERE username=$1 ORDER BY expiration_date ASC NULLS LAST`,
       [who]
@@ -120,7 +140,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/staff/credentials' && method === 'POST') {
     const { credential_name, expiration_date, notes } = body;
     const who = body.username && body.username !== currentUser.username ? body.username : currentUser.username;
-    if (who !== currentUser.username && !canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    if (who !== currentUser.username && !canManage(currentUser)) return json(403, { error: CREDENTIALS_DENIED });
     if (!credential_name || !credential_name.trim()) return json(400, { error: 'Credential name is required.' });
     // The expiration date is optional (some credentials never expire).
     if (!expiration_date && !(await expiryOptional(db))) return json(400, { error: NEEDS_UPDATE });
@@ -136,7 +156,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const id = path.split('/').pop();
     const existing = await db.query('SELECT username FROM "StaffCredentials" WHERE id=$1', [id]);
     if (!existing.rows[0]) return json(404, { error: 'Credential not found.' });
-    if (existing.rows[0].username !== currentUser.username && !canAdminister(currentUser)) {
+    if (existing.rows[0].username !== currentUser.username && !canManage(currentUser)) {
       return json(403, { error: 'You can only edit your own credentials.' });
     }
     const { credential_name, expiration_date, notes } = body;
@@ -160,7 +180,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const id = path.split('/').pop();
     const existing = await db.query('SELECT username FROM "StaffCredentials" WHERE id=$1', [id]);
     if (!existing.rows[0]) return json(404, { error: 'Credential not found.' });
-    if (existing.rows[0].username !== currentUser.username && !canAdminister(currentUser)) {
+    if (existing.rows[0].username !== currentUser.username && !canManage(currentUser)) {
       return json(403, { error: 'You can only delete your own credentials.' });
     }
     await db.query('DELETE FROM "StaffCredentials" WHERE id=$1', [id]);
