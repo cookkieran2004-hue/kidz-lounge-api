@@ -1,6 +1,7 @@
 const { json } = require('../lib/http');
 const { canAdminister } = require('../lib/roles');
 const { HttpError, assertNameAvailable, cascadeProviderRename } = require('../lib/providerNames');
+const { typeOf } = require('../lib/credentialTypes');
 
 async function handle({ path, method, qs, body, db, currentUser }) {
   // A provider counts as archived when their staff account is archived
@@ -24,6 +25,46 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       [includeArchived]
     );
     return json(200, result.rows);
+  }
+
+  // The provider directory (footer link, everyone signed in; Kieran, Oct
+  // 2026: the office's provider list, built only from what's saved): each
+  // provider with their credentials, the linked staff account's phone and
+  // email, NPI, discipline, license number (the License Number credential,
+  // else License/Registration's notes) and whether they're current (an
+  // active staff account is linked).
+  if (path === '/providers/directory' && method === 'GET') {
+    // Staff.date_of_birth (2026-10-31_staff_dob.sql), when it exists.
+    const hasDob = async (q) => (await q.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Staff' AND column_name = 'date_of_birth'`)).rows.length > 0;
+    const providers = (await db.query(`
+      SELECT p.id, p."Name" AS name, p.credentials, p.specialty, p.npi,
+             s.username, s.phone, s.email, s.archived, s.dob
+      FROM "Providers" p
+      LEFT JOIN LATERAL (
+        SELECT username, phone, email, archived, ${(await hasDob(db)) ? 'to_char(date_of_birth, \'MM-DD\')' : 'NULL'} AS dob
+        FROM "Staff" WHERE provider_name = p."Name" ORDER BY archived, id LIMIT 1
+      ) s ON true
+      ORDER BY lower(p."Name")`)).rows;
+    const usernames = providers.map(p => p.username).filter(Boolean);
+    const creds = usernames.length
+      ? (await db.query('SELECT username, credential_name, notes FROM "StaffCredentials" WHERE username = ANY($1) ORDER BY id', [usernames])).rows
+      : [];
+    const license = {};
+    for (const c of creds) {
+      const t = typeOf(c.credential_name);
+      const v = String(c.notes || '').trim();
+      if (!v) continue;
+      if (t === 'License Number') license[c.username] = { v, rank: 2 };
+      else if (t === 'License/Registration' && !(license[c.username]?.rank > 1)) license[c.username] = { v, rank: 1 };
+    }
+    return json(200, providers.map(p => ({
+      id: p.id, name: p.name, credentials: p.credentials || null, discipline: p.specialty || null, npi: p.npi || null,
+      phone: p.phone || null, email: p.email || null,
+      license_number: p.username ? license[p.username]?.v || null : null,
+      // Month and day only ('MM-DD'), like the office's list.
+      birthday: p.dob || null,
+      current: !!p.username && !p.archived,
+    })));
   }
 
   if (path === '/providers' && method === 'POST') {

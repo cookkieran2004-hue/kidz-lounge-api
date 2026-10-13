@@ -39,6 +39,20 @@ function normalizePhone(value) {
   return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
 }
 
+// Staff date of birth (migrations/2026-10-31_staff_dob.sql); until it's
+// run, profiles just don't show it. Only a "yes" is remembered.
+let dobColumn = false;
+async function hasDobColumn(db) {
+  if (dobColumn) return true;
+  try {
+    const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Staff' AND column_name = 'date_of_birth'`);
+    dobColumn = !!r.rows[0];
+  } catch { dobColumn = false; }
+  return dobColumn;
+}
+// '' / null clears it; otherwise it must be a YYYY-MM-DD date. undefined = invalid.
+const cleanDob = (v) => (v === '' || v === null ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : undefined);
+
 async function handle({ path, method, qs, body, db, currentUser }) {
   // Lightweight, non-admin-gated staff list -- any staff member can edit a
   // patient's Case Manager, so the dropdown that populates it needs to be
@@ -69,7 +83,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // themselves without asking an admin.
   if (path === '/staff/me' && method === 'GET') {
     const result = await db.query(
-      `SELECT username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date
+      `SELECT username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date${(await hasDobColumn(db)) ? ', date_of_birth' : ''}
        FROM "Staff" WHERE username=$1`,
       [currentUser.username]
     );
@@ -80,10 +94,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const { email, preferred_name } = body;
     const phone = normalizePhone(body.phone);
     if (phone === undefined) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
+    const hasDob = Object.prototype.hasOwnProperty.call(body, 'date_of_birth') && (await hasDobColumn(db));
+    const dob = hasDob ? cleanDob(body.date_of_birth) : null;
+    if (dob === undefined) return json(400, { error: 'Enter your date of birth as a date.' });
     const result = await db.query(
-      `UPDATE "Staff" SET phone=$1, email=$2, preferred_name=$3 WHERE username=$4
-       RETURNING username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date`,
-      [phone, email || null, preferred_name || null, currentUser.username]
+      `UPDATE "Staff" SET phone=$1, email=$2, preferred_name=$3${hasDob ? ', date_of_birth=$5' : ''} WHERE username=$4
+       RETURNING username, role, provider_name, first_name, middle_name, last_name, preferred_name, position, phone, email, hire_date${(await hasDobColumn(db)) ? ', date_of_birth' : ''}`,
+      [phone, email || null, preferred_name || null, currentUser.username, ...(hasDob ? [dob] : [])]
     );
     return json(200, result.rows[0]);
   }
@@ -155,7 +172,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!canManage(currentUser)) return json(403, { error: 'Admin access required.' });
     const result = await db.query(
       `SELECT id, username, role, provider_name, must_reset_password, created_at, last_login,
-              first_name, middle_name, last_name, preferred_name, position, archived, hire_date, phone, email${(await hasEmploymentColumn(db)) ? ', employment_type' : ''}
+              first_name, middle_name, last_name, preferred_name, position, archived, hire_date, phone, email${(await hasEmploymentColumn(db)) ? ', employment_type' : ''}${(await hasDobColumn(db)) ? ', date_of_birth' : ''}
        FROM "Staff" ORDER BY archived, username`
     );
     return json(200, result.rows);
@@ -228,6 +245,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const hasEmail = Object.prototype.hasOwnProperty.call(body, 'email');
     const phoneValue = hasPhone ? normalizePhone(body.phone) : null;
     if (hasPhone && phoneValue === undefined) return json(400, { error: 'Enter a full 10-digit phone number, or leave it blank.' });
+    // Date of birth (staff profile's Account and role), only when sent.
+    const hasDob = Object.prototype.hasOwnProperty.call(body, 'date_of_birth') && (await hasDobColumn(db));
+    const dobValue = hasDob ? cleanDob(body.date_of_birth) : null;
+    if (dobValue === undefined) return json(400, { error: 'Enter the date of birth as a date.' });
     if (role !== undefined && role !== null && role !== '' && !ROLES.includes(role)) {
       return json(400, { error: `Role must be one of: ${ROLES.join(', ')}.` });
     }
@@ -287,6 +308,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         [hasPhone, phoneValue, hasEmail, String(body.email || '').trim() || null, updated.id]
       );
       Object.assign(updated, contact.rows[0]);
+    }
+    if (hasDob) {
+      const d = await client.query('UPDATE "Staff" SET date_of_birth=$1 WHERE id=$2 RETURNING date_of_birth', [dobValue, updated.id]);
+      Object.assign(updated, d.rows[0]);
     }
     const savedType = await saveEmploymentType(client, updated.id, body);
     if (savedType) updated.employment_type = savedType;
