@@ -43,18 +43,37 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/tasks' && method === 'POST') {
     const { title, description, assigned_to, due_date } = body;
     if (!title || !title.trim()) return json(400, { error: 'Title is required.' });
-    if (!assigned_to || !assigned_to.trim()) return json(400, { error: 'A task must be assigned to someone.' });
+    // One username, or a list of them (Oct 2026): each person gets their own
+    // copy of the task, so each ticks off their own.
+    const many = Array.isArray(assigned_to);
+    const assignees = [...new Set((many ? assigned_to : [assigned_to])
+      .map(u => (typeof u === 'string' ? u.trim() : '')).filter(Boolean))];
+    if (!assignees.length) return json(400, { error: 'A task must be assigned to someone.' });
     // Anyone can create a task for themselves; only an admin can assign a
     // task to someone else.
-    if (assigned_to.trim() !== currentUser.username && !canManage(currentUser)) {
+    if (assignees.some(u => u !== currentUser.username) && !canManage(currentUser)) {
       return json(403, { error: 'Only an admin can assign a task to someone else.' });
     }
-    const result = await db.query(
-      `INSERT INTO "Tasks" (title, description, assigned_to, assigned_by, due_date, source)
-       VALUES ($1, $2, $3, $4, $5, 'manual') RETURNING *`,
-      [title.trim(), description || null, assigned_to.trim(), currentUser.username, due_date || null]
-    );
-    return json(201, result.rows[0]);
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const rows = [];
+      for (const username of assignees) {
+        const result = await client.query(
+          `INSERT INTO "Tasks" (title, description, assigned_to, assigned_by, due_date, source)
+           VALUES ($1, $2, $3, $4, $5, 'manual') RETURNING *`,
+          [title.trim(), description || null, username, currentUser.username, due_date || null]
+        );
+        rows.push(result.rows[0]);
+      }
+      await client.query('COMMIT');
+      return json(201, many ? rows : rows[0]);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   if (path.match(/^\/tasks\/[^/]+$/) && method === 'PUT') {

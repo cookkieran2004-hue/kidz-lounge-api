@@ -57,7 +57,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       if (t === 'License Number') license[c.username] = { v, rank: 2 };
       else if (t === 'License/Registration' && !(license[c.username]?.rank > 1)) license[c.username] = { v, rank: 1 };
     }
-    return json(200, providers.map(p => ({
+    // Archived providers (their only staff account is archived) are left out
+    // entirely (Kieran, Oct 2026). Providers who never had an account still
+    // show, as not current.
+    return json(200, providers.filter(p => !(p.username && p.archived)).map(p => ({
       id: p.id, name: p.name, credentials: p.credentials || null, discipline: p.specialty || null, npi: p.npi || null,
       phone: p.phone || null, email: p.email || null,
       license_number: p.username ? license[p.username]?.v || null : null,
