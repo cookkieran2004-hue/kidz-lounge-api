@@ -3,6 +3,7 @@ const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
 const { isHold } = require('../lib/caseload');
+const { applyCancelReason } = require('../lib/cancelReason');
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).
@@ -121,15 +122,15 @@ async function handle(ctx) {
     );
     if (makeupFor !== null) {
       const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
-      return json(201, marked.rows[0]);
+      return json(201, await applyCancelReason(db, marked.rows[0], body));
     }
     // An eval (booked from the patient chart; migrations/2026-10-19_evals.sql).
     if (body.is_eval === true) {
-      if (!(await hasEvalColumn(db))) return json(201, result.rows[0]);
+      if (!(await hasEvalColumn(db))) return json(201, await applyCancelReason(db, result.rows[0], body));
       const marked = await db.query('UPDATE "Appointments" SET is_eval=true WHERE id=$1 RETURNING *', [result.rows[0].id]);
-      return json(201, marked.rows[0]);
+      return json(201, await applyCancelReason(db, marked.rows[0], body));
     }
-    return json(201, result.rows[0]);
+    return json(201, await applyCancelReason(db, result.rows[0], body));
   }
 
   if (path.match(/^\/appointments\/[^/]+$/) && method === 'PUT') {
@@ -158,7 +159,7 @@ async function handle(ctx) {
         id,
       ]
     );
-    return json(200, result.rows[0]);
+    return json(200, await applyCancelReason(db, result.rows[0], body));
   }
 
   if (path.match(/^\/appointments\/[^/]+\/comments$/) && method === 'PUT') {
@@ -303,7 +304,7 @@ async function handle(ctx) {
         deleted || false,
       ]
     );
-    return json(201, result.rows[0]);
+    return json(201, await applyCancelReason(db, result.rows[0], body));
   }
 
   // Marks an existing real exception row as deleted, rather than removing

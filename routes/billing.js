@@ -21,7 +21,9 @@ async function hasTable(db, name) {
 // anyone with an appointment in the month, any status, plus -- for the
 // current month -- anyone booked with them later on.
 // A day's mark, once the day has ended:
-//   H / Z  the office was closed (closure_type holiday / emergency)
+//   H / Z  the office was closed (closure_type holiday / emergency), or an
+//          offsite session was Canceled because the school/home was closed
+//          (cancel_reason holiday / emergency; lib/cancelReason.js)
 //   PA     the provider had any out-of-office block over the session (PTO,
 //          UPTO, Unavailable, Other, Lunch, Meeting -- every type, Oct 2026)
 //   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
@@ -128,6 +130,13 @@ async function buildSheet(db, provider, month) {
     const date = String(a.appointment_date).slice(0, 10);
     // A closure is known in advance, so it shows even before the day ends.
     if (closures[date]) return closures[date].type === 'emergency' ? 'Z' : 'H';
+    // The same for an offsite session canceled for a holiday or emergency
+    // closure there (Kieran, Oct 2026). 'other' or no reason stays A.
+    // Both come before providerAbsent on purpose: H / Z wins over PA even
+    // when the provider was also out, and their PTO / UPTO still counts in
+    // the time-off tally at the bottom (timeOffHours, from the requests).
+    if (a.appointment_status === 'Canceled' && a.cancel_reason === 'holiday') return 'H';
+    if (a.appointment_status === 'Canceled' && a.cancel_reason === 'emergency') return 'Z';
     if (date >= today) return null; // the day hasn't ended yet
     if (providerAbsent(a)) return 'PA';
     if (a.is_makeup) return 'M';
