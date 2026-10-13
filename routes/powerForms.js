@@ -3,6 +3,7 @@ const { json } = require('../lib/http');
 const { canManage, canAdminister } = require('../lib/roles');
 const audit = require('../lib/audit');
 const pf = require('../lib/powerForms');
+const { deleteDocument } = require('./documents');
 const { PATIENT_TASK_FALLBACK_ROLES } = require('../lib/roles');
 
 // Power Forms (Kieran, Oct 2026; migrations/2026-10-27_power_forms.sql).
@@ -172,6 +173,21 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       patient_name: patient ? patient.Name : null,
       changes: r.status === 'completed' && patient ? pf.chartChanges(r.fields, answers, patient) : [],
     });
+  }
+
+  // Delete a form for good (Admins and Developers; Kieran, Oct 2026): its
+  // answers, its PDF in the patient's Documents, and any review tasks still
+  // open. Changes already applied to the chart stay. The audit log keeps
+  // who deleted it.
+  if (!action && method === 'DELETE') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Only Admins and Developers can delete forms.' });
+    if (r.document_id) {
+      const doc = (await db.query('SELECT id FROM "PatientDocuments" WHERE id::text=$1 AND patient_id::text=$2', [String(r.document_id), String(r.patient_id)])).rows[0];
+      if (doc) await deleteDocument(db, doc.id);
+    }
+    await db.query(`DELETE FROM "Tasks" WHERE deadline_type=$1 AND status <> 'done'`, [taskKey(id)]).catch(() => {});
+    await db.query('DELETE FROM "PowerFormRequests" WHERE id=$1', [id]);
+    return json(200, { deleted: true });
   }
 
   if (action === 'new-link' && method === 'POST') {

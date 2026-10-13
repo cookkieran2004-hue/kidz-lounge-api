@@ -15,6 +15,24 @@ const s3 = new S3Client({
 });
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME;
 
+// Deletes a document's file and its record. false if there's no such
+// document. Also used when a Power Form with a saved PDF is deleted.
+async function deleteDocument(db, docId) {
+  const doc = (await db.query('SELECT * FROM "PatientDocuments" WHERE id::text=$1', [String(docId)])).rows[0];
+  if (!doc) return false;
+  if (S3_BUCKET_NAME) {
+    try {
+      await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET_NAME, Key: doc.s3_key }));
+    } catch (err) {
+      // Don't leave an undeleteable "stuck" record behind just because
+      // the S3 side failed -- remove the DB row regardless, but log it.
+      console.error('Failed to delete S3 object:', err);
+    }
+  }
+  await db.query('DELETE FROM "PatientDocuments" WHERE id=$1', [doc.id]);
+  return true;
+}
+
 // ---------- Patient Documents (S3-backed, any staff can upload/delete) ----------
 async function handle({ path, method, body, db, currentUser }) {
   if (path.match(/^\/patients\/[^/]+\/documents\/upload-url$/) && method === 'POST') {
@@ -74,20 +92,7 @@ async function handle({ path, method, body, db, currentUser }) {
 
   if (path.match(/^\/documents\/[^/]+$/) && method === 'DELETE') {
     const docId = path.split('/').pop();
-    const docRes = await db.query('SELECT * FROM "PatientDocuments" WHERE id=$1', [docId]);
-    const doc = docRes.rows[0];
-    if (!doc) return json(404, { error: 'Document not found.' });
-
-    if (S3_BUCKET_NAME) {
-      try {
-        await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET_NAME, Key: doc.s3_key }));
-      } catch (err) {
-        // Don't leave an undeleteable "stuck" record behind just because
-        // the S3 side failed -- remove the DB row regardless, but log it.
-        console.error('Failed to delete S3 object:', err);
-      }
-    }
-    await db.query('DELETE FROM "PatientDocuments" WHERE id=$1', [docId]);
+    if (!(await deleteDocument(db, docId))) return json(404, { error: 'Document not found.' });
     return json(200, { deleted: true });
   }
 
@@ -173,4 +178,4 @@ async function handle({ path, method, body, db, currentUser }) {
   return null;
 }
 
-module.exports = { handle };
+module.exports = { handle, deleteDocument };
