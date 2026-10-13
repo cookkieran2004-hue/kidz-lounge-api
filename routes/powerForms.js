@@ -479,7 +479,7 @@ async function handlePublic({ path, method, body, db, meta }) {
     const child_first_name = String(patient.Name || '').trim().split(/\s+/)[0] || null;
     // The form is labelled with who it's for, like a chart label, and the
     // patient's saved details are filled in (only now the DOB matched).
-    const label = { name: patient.Name, dob: real, id_number: patient.ID_Number || null };
+    const label = { name: patient.Name, dob: real, mrn: patient.mrn || null };
     const fill = (fields) => pf.withPatient(fields, patient);
     if (kind === 'packet') {
       await db.query('UPDATE "PowerFormPackets" SET failed_checks=0, opened_at=COALESCE(opened_at, now()) WHERE id=$1', [link.id]);
