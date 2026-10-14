@@ -5,9 +5,11 @@ const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../
 const { isHold } = require('../lib/caseload');
 const { applyCancelReason } = require('../lib/cancelReason');
 const { applyOutsideHours } = require('../lib/outsideHours');
+const { applyAbsenceReason } = require('../lib/absenceReason');
 
-// Both per-session details, after any appointment row is written.
-const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyCancelReason(db, row, body), body, opts);
+// The per-session details, after any appointment row is written. The
+// absence reason comes after the cancel reason: a closure reason clears it.
+const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts);
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).

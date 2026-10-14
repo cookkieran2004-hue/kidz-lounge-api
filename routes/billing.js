@@ -4,6 +4,10 @@ const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
 const { clinicToday, isHold, currentCaseloads } = require('../lib/caseload');
 const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
 const patientPrograms = require('../lib/patientPrograms');
+const { makeMarker, loadClosures } = require('../lib/billingMarks');
+const { unitTotals, TOTAL_COLUMNS } = require('../lib/billingTotals');
+const { featureOn } = require('../lib/features');
+const { computeMandates } = require('../lib/mandates');
 // Positive-only cache, so the code works before a migration has run.
 const tableSeen = new Set();
 async function hasTable(db, name) {
@@ -20,23 +24,9 @@ async function hasTable(db, name) {
 // A row per patient on the provider's caseload that month (lib/caseload.js):
 // anyone with an appointment in the month, any status, plus -- for the
 // current month -- anyone booked with them later on.
-// A day's mark, once the day has ended:
-//   H / Z  the office was closed (closure_type holiday / emergency), or an
-//          offsite session was Canceled because the school/home was closed
-//          (cancel_reason holiday / emergency; lib/cancelReason.js)
-//   PA     the provider had any out-of-office block over the session (PTO,
-//          UPTO, Unavailable, Other, Lunch, Meeting -- every type, Oct 2026)
-//   X      session provided (Scheduled, Confirmed, Left Message, Emailed)
-//   A      child absent (No Show, Canceled)
-//   E      an evaluation (is_eval; migrations/2026-10-19_evals.sql)
-//   M      a make-up session (is_makeup; migrations/2026-10-17_makeups.sql)
+// A day's mark: lib/billingMarks.js.
 // *HOLD* sessions and the "HOLD - see comments" placeholder never show.
 
-const STATUS_MARK = {
-  Scheduled: 'X', Confirmed: 'X', 'Left Message': 'X', Emailed: 'X',
-  'No Show': 'A', Canceled: 'A',
-  'Make Up': 'M', MUS: 'M', // retired statuses, in case any are left
-};
 const DISCIPLINE = { ST: 'Speech Therapy', OT: 'Occupational Therapy', PT: 'Physical Therapy', SI: 'Special Instruction' };
 // A provider's disciplines from Providers.specialty, saved as "ST/OT" by the
 // specialty picker (older rows may use commas): ['ST', 'OT']. Splitting on
@@ -79,14 +69,6 @@ function settingOf(area) {
 // Every setting used in a row, in C, S, H order: "C, S".
 const joinSettings = (set) => ['C', 'S', 'H'].filter(x => set.has(x)).join(', ');
 
-let closureTypeSeen = false;
-async function hasClosureType(db) {
-  if (closureTypeSeen) return true;
-  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name='OfficeClosures' AND column_name='closure_type'`);
-  if (r.rows.length) closureTypeSeen = true;
-  return closureTypeSeen;
-}
-
 async function buildSheet(db, provider, month) {
   const start = `${month}-01`;
   const [y, m] = month.split('-').map(Number);
@@ -94,10 +76,10 @@ async function buildSheet(db, provider, month) {
   const end = `${month}-${pad(daysInMonth)}`;
   const today = clinicToday();
 
-  const [apptsAll, oooAll, closuresRes, providerRes, staffRes] = await Promise.all([
+  const [apptsAll, oooAll, closures, providerRes, staffRes] = await Promise.all([
     getMergedAppointments(db, { startDate: start, endDate: end, provider }),
     getMergedOOO(db, { startDate: start, endDate: end, provider }),
-    db.query(`SELECT closure_date, reason${(await hasClosureType(db)) ? ', closure_type' : ''} FROM "OfficeClosures" WHERE closure_date BETWEEN $1 AND $2`, [start, end]),
+    loadClosures(db, start, end),
     db.query('SELECT "Name", specialty FROM "Providers" WHERE "Name"=$1', [provider]),
     db.query('SELECT phone FROM "Staff" WHERE provider_name=$1 AND archived = false LIMIT 1', [provider]),
   ]);
@@ -121,40 +103,7 @@ async function buildSheet(db, provider, month) {
     : [];
   const patientByName = Object.fromEntries(patients.map(p => [p.Name, p]));
 
-  const closures = {};
-  closuresRes.rows.forEach(c => {
-    closures[String(c.closure_date).slice(0, 10)] = { type: c.closure_type === 'emergency' ? 'emergency' : 'holiday', reason: c.reason || null };
-  });
-  // Every out-of-office type counts, meetings and lunch included.
-  const absences = oooAll;
-  const providerAbsent = (a) => absences.some(o => {
-    if (String(o.ooo_date).slice(0, 10) !== String(a.appointment_date).slice(0, 10)) return false;
-    const s = mins(a.appointment_time);
-    const e = s + (Number(a.duration) || 30);
-    return mins(o.start_time) < e && s < mins(o.end_time);
-  });
-  // Order matters: a closure, then the provider being out, win over the
-  // session's status -- a session Canceled (or No Show) while the provider
-  // was on PTO/UPTO/Unavailable is PA, not A.
-  const markFor = (a) => {
-    const date = String(a.appointment_date).slice(0, 10);
-    // A closure is known in advance, so it shows even before the day ends.
-    // An outside-hours session isn't affected by an office closure: it
-    // happened anyway, and counts as usual (Kieran, Oct 2026).
-    if (closures[date] && !a.outside_hours) return closures[date].type === 'emergency' ? 'Z' : 'H';
-    // The same for an offsite session canceled for a holiday or emergency
-    // closure there (Kieran, Oct 2026). 'other' or no reason stays A.
-    // Both come before providerAbsent on purpose: H / Z wins over PA even
-    // when the provider was also out, and their PTO / UPTO still counts in
-    // the time-off tally at the bottom (timeOffHours, from the requests).
-    if (a.appointment_status === 'Canceled' && a.cancel_reason === 'holiday') return 'H';
-    if (a.appointment_status === 'Canceled' && a.cancel_reason === 'emergency') return 'Z';
-    if (date >= today) return null; // the day hasn't ended yet
-    if (providerAbsent(a)) return 'PA';
-    if (a.is_makeup) return 'M';
-    if (a.is_eval) return 'E';
-    return STATUS_MARK[a.appointment_status] || 'X';
-  };
+  const markFor = makeMarker({ closures, ooo: oooAll, today });
 
   // Which program (and mandate) each session bills under: the patient's
   // program history on the session's date, for this provider's discipline
@@ -224,6 +173,8 @@ async function buildSheet(db, provider, month) {
     rows,
     reviewed,
     time_off: timeOff,
+    // The payroll totals in 30-minute units (lib/billingTotals.js).
+    totals: unitTotals(rows),
   };
 }
 
@@ -438,6 +389,31 @@ async function timeOffHours(db, provider, start, end) {
   return out;
 }
 
+// Every provider's month (the "mandates" feature's overview): their payroll
+// totals in 30-minute units, PTO / UPTO taken and Reviewed, from the same
+// billing sheet each one opens to (buildSheet). `own`: just that provider.
+async function monthOverview(db, month, own = null) {
+  const start = `${month}-01`;
+  const [y, m] = month.split('-').map(Number);
+  const end = `${month}-${pad(new Date(y, m, 0).getDate())}`;
+  let names;
+  if (own) names = [own];
+  else {
+    const appts = await getMergedAppointments(db, { startDate: start, endDate: end });
+    names = [...new Set(appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)).map(a => a.provider).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  }
+  const providers = [];
+  for (const name of names) {
+    const sheet = await buildSheet(db, name, month);
+    providers.push({ provider: name, discipline: sheet.discipline, totals: sheet.totals, time_off: { PTO: sheet.time_off?.PTO ?? 0, UPTO: sheet.time_off?.UPTO ?? 0 }, reviewed: sheet.reviewed });
+  }
+  const clinic = Object.fromEntries(TOTAL_COLUMNS.map(([k]) => [k, providers.reduce((t, p) => t + p.totals[k], 0)]));
+  clinic.sessions = providers.reduce((t, p) => t + p.totals.sessions, 0);
+  clinic.PTO = providers.reduce((t, p) => t + Number(p.time_off.PTO || 0), 0);
+  clinic.UPTO = providers.reduce((t, p) => t + Number(p.time_off.UPTO || 0), 0);
+  return { month, start, end, today: clinicToday(), columns: TOTAL_COLUMNS, providers, clinic };
+}
+
 async function handle(ctx) {
   const { path, method, qs, body, db, currentUser } = ctx;
 
@@ -450,7 +426,58 @@ async function handle(ctx) {
     const month = String(qs.month || '').trim();
     if (!provider) return json(400, { error: 'Choose a provider.' });
     if (!/^\d{4}-\d{2}$/.test(month)) return json(400, { error: 'Choose a month.' });
-    return json(200, await buildSheet(db, provider, month));
+    const sheet = await buildSheet(db, provider, month);
+    // With mandates on: problem sessions are flagged on the sheet (a make-up
+    // past its 14 days or on a regular session's day, more sessions than the
+    // mandate allows; lib/mandates.js).
+    if (featureOn('mandates')) {
+      const { session_flags: flags } = await computeMandates(db, { month, provider });
+      for (const r of sheet.rows) for (const entries of Object.values(r.days)) for (const e of entries) if (flags[String(e.id)]) e.flags = flags[String(e.id)];
+    }
+    return json(200, sheet);
+  }
+
+  // ---- Month overview, mandates, needs attention (the "mandates" feature) ----
+  // Reception, Admin and Developer see every provider and child; a provider
+  // sees only their own row and the children they saw.
+  const billingFeature = ['/billing/overview', '/billing/mandates', '/billing/attention', '/billing/program-on'].includes(path);
+  if (billingFeature && method === 'GET') {
+    if (!featureOn('mandates')) return json(404, { error: 'Not available at this clinic.' });
+    const manager = canManage(currentUser);
+    const own = manager ? null : currentUser.providerName;
+    if (!manager && !own) return json(403, { error: 'No provider is linked to your account.' });
+
+    // The program a session would bill under (the appointment window asks
+    // why a child was absent only for EI): ?patient=&provider=&date=
+    if (path === '/billing/program-on') {
+      const { patient, date } = qs;
+      const prov = qs.provider;
+      if (!patient || !prov || !/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return json(400, { error: 'patient, provider and date are required.' });
+      const p = (await db.query('SELECT id, "Program" FROM "Patients" WHERE "Name"=$1', [patient])).rows[0];
+      if (!p) return json(200, { program: null, group: null });
+      const spec = (await db.query('SELECT specialty FROM "Providers" WHERE "Name"=$1', [prov])).rows[0]?.specialty;
+      const history = await patientPrograms.historyFor(db, [p.id]);
+      const hit = patientPrograms.programFor(history[p.id], date, disciplinesOf(spec));
+      const program = hit?.program || p.Program || null;
+      return json(200, { program, group: program ? groupFor(program) : null });
+    }
+
+    const month = String(qs.month || '').trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) return json(400, { error: 'Choose a month.' });
+    if (path === '/billing/mandates') return json(200, await computeMandates(db, { month, provider: own || qs.provider || null }));
+    const overview = await monthOverview(db, month, own);
+    if (path === '/billing/overview') return json(200, overview);
+    // Needs attention: the mandates' problems plus each sheet's (not
+    // reviewed after the month ended, sessions no total counts).
+    const mandates = await computeMandates(db, { month, provider: own });
+    const issues = [...mandates.issues];
+    for (const pr of overview.providers) {
+      for (const m of pr.totals.missed) issues.push({ type: 'not_counted', severity: 'warning', providers: [pr.provider], patient_name: m.patient_name, date: `${month}-${pad(m.day)}`, text: `Not in any payroll total: ${m.reason}` });
+      if (!pr.reviewed && overview.end < overview.today) issues.push({ type: 'not_reviewed', severity: 'warning', providers: [pr.provider], text: `${pr.provider}'s billing sheet isn't marked reviewed` });
+    }
+    const rank = { danger: 0, warning: 1 };
+    issues.sort((a, b) => rank[a.severity] - rank[b.severity] || String(a.date || '').localeCompare(String(b.date || '')));
+    return json(200, { month, today: mandates.today, issues });
   }
 
   // A provider's caseload right now (staff profile > Caseload): each patient
