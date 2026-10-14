@@ -213,7 +213,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     note = (await db.query(
       `UPDATE "EiSessionNotes" SET provider_signature=$1, provider_license=$2, provider_signed_at=now(), provider_signed_by=$3, header=$4, updated_at=now()
        WHERE id=$5 AND provider_signed_at IS NULL RETURNING *`,
-      [b.signature, license, currentUser.username, { ...info.header, license }, note.id]
+      [b.signature, license, currentUser.username, { ...info.header, license, outcomes: info.outcomes.filter(o => (note.outcome_ids || []).includes(o.id)) }, note.id]
     )).rows[0];
     if (!note) return json(409, { error: 'This note was already signed. Reload the page.' });
     return json(200, { note, status: notes.noteStatus(note) });

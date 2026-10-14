@@ -65,7 +65,10 @@ async function cleanIfsp(db, patientId, body) {
     const services = [...new Set((Array.isArray(o.services) ? o.services : []).map(s => String(s).toUpperCase()))];
     const unknown = services.find(s => !SERVICES.includes(s));
     if (unknown) return { error: `"${unknown}" isn't a service this list knows.` };
-    cleanOutcomes.push({ outcome, services });
+    // Developmental steps (1a, 1b, ...; migrations/2026-11-06_ei_progress_reports.sql).
+    const steps = (Array.isArray(o.steps) ? o.steps : []).map(x => text(x, 1000)).filter(Boolean);
+    if (steps.length > 12) return { error: 'An outcome can have up to 12 developmental steps here.' };
+    cleanOutcomes.push({ id: Number.isInteger(Number(o.id)) && Number(o.id) > 0 ? Number(o.id) : null, outcome, services, steps });
   }
   // US 10-digit, stored as (555) 555-5555 like every other phone number.
   let scPhone = null;
@@ -105,7 +108,7 @@ async function loadIfsps(db, patientId) {
   return rows.map(r => ({
     ...r,
     report_due: ifsp.reportDue(r.end_date),
-    outcomes: outcomes.filter(o => o.ifsp_id === r.id).map(o => ({ id: o.id, outcome: o.outcome, services: o.services })),
+    outcomes: outcomes.filter(o => o.ifsp_id === r.id).map(o => ({ id: o.id, outcome: o.outcome, services: o.services, steps: o.steps || [] })),
   }));
 }
 
@@ -123,10 +126,29 @@ async function syncPatient(q, patientId) {
   );
 }
 
+// Outcomes keep their ids when edited (session notes record which outcomes
+// a session worked on by id): an outcome sent with its id is updated in
+// place, one without is added, and only those left out are removed.
+let stepsColumn = false;
+async function hasStepsColumn(q) {
+  if (stepsColumn) return true;
+  const r = await q.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiIfspOutcomes' AND column_name = 'steps'`);
+  stepsColumn = !!r.rows[0];
+  return stepsColumn;
+}
 async function saveOutcomes(q, ifspId, outcomes) {
-  await q.query('DELETE FROM "EiIfspOutcomes" WHERE ifsp_id=$1', [ifspId]);
+  const steps = await hasStepsColumn(q);
+  const existing = new Set((await q.query('SELECT id FROM "EiIfspOutcomes" WHERE ifsp_id=$1', [ifspId])).rows.map(r => r.id));
+  const kept = outcomes.filter(o => o.id && existing.has(o.id)).map(o => o.id);
+  await q.query('DELETE FROM "EiIfspOutcomes" WHERE ifsp_id=$1 AND NOT (id = ANY($2))', [ifspId, kept]);
   for (const [i, o] of outcomes.entries()) {
-    await q.query('INSERT INTO "EiIfspOutcomes" (ifsp_id, position, outcome, services) VALUES ($1,$2,$3,$4)', [ifspId, i, o.outcome, o.services]);
+    if (o.id && existing.has(o.id)) {
+      await q.query(`UPDATE "EiIfspOutcomes" SET position=$1, outcome=$2, services=$3${steps ? ', steps=$5' : ''} WHERE id=$4`,
+        steps ? [i, o.outcome, o.services, o.id, o.steps] : [i, o.outcome, o.services, o.id]);
+    } else {
+      await q.query(`INSERT INTO "EiIfspOutcomes" (ifsp_id, position, outcome, services${steps ? ', steps' : ''}) VALUES ($1,$2,$3,$4${steps ? ',$5' : ''})`,
+        steps ? [ifspId, i, o.outcome, o.services, o.steps] : [ifspId, i, o.outcome, o.services]);
+    }
   }
 }
 

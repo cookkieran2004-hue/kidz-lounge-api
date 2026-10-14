@@ -40,6 +40,7 @@ const eiHubRoutes = require('./routes/eiHub');
 const powerFormRoutes = require('./routes/powerForms');
 const ifspRoutes = require('./routes/ifsp');
 const sessionNoteRoutes = require('./routes/sessionNotes');
+const progressReportRoutes = require('./routes/progressReports');
 const developerRoutes = require('./routes/developer');
 const audit = require('./lib/audit');
 
@@ -49,7 +50,7 @@ const audit = require('./lib/audit');
 // but grouping stays roughly domain-by-domain for readability.
 const ROUTE_MODULES = [
   staffRoutes, providerRoutes, patientRoutes, appointmentRoutes,
-  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes, powerFormRoutes, ifspRoutes, sessionNoteRoutes, developerRoutes,
+  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes, powerFormRoutes, ifspRoutes, sessionNoteRoutes, progressReportRoutes, developerRoutes,
 ];
 
 // Which scheduled job an EventBridge event is for: its `job` (a rule with a
