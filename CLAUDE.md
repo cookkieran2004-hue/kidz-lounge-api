@@ -131,6 +131,16 @@ Kieran plans to deploy this API for other pediatric therapy clinics, one deploym
 - **No AWS region, account or bucket names in code.** Read them from environment variables.
 - **Never type the clinic's name in new messages.** Say "the office" or similar. Older mentions stay until the generic version is built.
 
+## Per-clinic features (Oct 2026)
+
+Kieran is building PedsDesk into the EMR for NYC Early Intervention agencies (session notes, EI-Hub billing, authorizations / IFSPs, reports). **Kidz Lounge must not be affected at all**, and `main` reaches Kidz Lounge every night, so all of it sits behind a per-clinic switch:
+
+- `featureOn(name)` from `lib/features.js` reads `FEATURES` on the Lambda (comma-separated; unset = none). The Demo's comes from clinic-platform (`clinics/demo.env` `FEATURES=`, the template's `Features` parameter); Kidz Lounge's Lambda doesn't set it. The website's partner is `features` in `src/brands/<clinic>.js`; set both. A feature-only route answers 404 where it's off.
+- **`ei`**: on for the Demo / PedsDesk, off for Kidz Lounge.
+- **With a switch off, everything behaves exactly as before.** Shared screens and routes (schedule, appointment form, patient chart, billing) only branch on the switch; never change their existing behavior to suit the feature.
+- **Schema changes are additive only** (new tables, new nullable columns). Never rename, drop or tighten anything Kidz Lounge uses.
+- Kieran flips switches by code change; there's no setting in the app.
+
 ## Testing
 
 There's no test suite. For logic changes, write a throwaway script in the session scratchpad:
