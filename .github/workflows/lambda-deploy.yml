@@ -36,6 +36,9 @@ jobs:
           cp index.js package.json package-lock.json dist/
           cp -r lib routes migrations dist/
           npm ci --omit=dev --prefix dist
+          # Which commit this is and when it went out, for the central view's
+          # practice health (routes/developer.js).
+          printf '{"sha":"%s","deployed_at":"%s"}\n' "$GITHUB_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > dist/build.json
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
