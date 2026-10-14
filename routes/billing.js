@@ -536,6 +536,13 @@ async function handle(ctx) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointment_date || '')) || !/^\d{2}:\d{2}/.test(String(appointment_time || '')) || !(Number(duration) > 0)) {
       return json(400, { error: 'The session date, time and length are required.' });
     }
+    // PedsDesk ("ei" feature): billing by hand needs the signed session
+    // note too, as a claim file does (routes/eiHub.js). Required here, not
+    // at the top: lib/sessionNotes.js requires this file.
+    if (featureOn('ei') && (await hasTable(db, 'EiSessionNotes'))) {
+      const done = await require('../lib/sessionNotes').completeNoteKeys(db, [key]);
+      if (!done.has(key)) return json(409, { error: 'This session has no session note signed by the provider and the parent yet, so it can\'t be billed.' });
+    }
     await db.query(
       `INSERT INTO "EiHubEntries" (session_key, patient_name, appointment_date, appointment_time, duration, provider, entered_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -566,4 +573,5 @@ async function handle(ctx) {
   return null;
 }
 
-module.exports = { handle, groupFor, buildSheet, eiHubSessions, sessionKey };
+// eiServiceFor / settingOf / disciplinesOf: also EI session notes (lib/sessionNotes.js).
+module.exports = { handle, groupFor, buildSheet, eiHubSessions, sessionKey, eiServiceFor, settingOf, disciplinesOf, SESSION_KEY_RE };

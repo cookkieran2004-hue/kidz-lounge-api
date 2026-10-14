@@ -1,5 +1,7 @@
 const { json } = require('../lib/http');
 const { canUseEiHub, canManage } = require('../lib/roles');
+const { featureOn } = require('../lib/features');
+const sessionNotes = require('../lib/sessionNotes');
 const { ALLOWED_CODES, COUNTY_CODES, validNpi, normalizeIcd10, codesFor, linesFor, visitRate } = require('../lib/eiHubCodes');
 const { build837, splitName, splitCharge } = require('../lib/ei837');
 const { eiHubSessions } = require('./billing');
@@ -135,6 +137,11 @@ async function claimData(db, month) {
   const sent = {};
   claimsRes.rows.forEach(c => { sent[c.session_key] = c; }); // latest wins
   const cutoff = new Date(Date.now() - FILING_DAYS * 86400000).toISOString().slice(0, 10);
+  // PedsDesk ("ei" feature, Kieran Oct 2026): no claim without a session
+  // note signed by the provider and the parent (lib/sessionNotes.js). Off
+  // at Kidz Lounge, where this list is exactly as before.
+  const notesSigned = featureOn('ei') && (await db.query(`SELECT to_regclass('"EiSessionNotes"') AS t`)).rows[0]?.t
+    ? await sessionNotes.completeNoteKeys(db, keys) : null;
 
   const rows = sessions.map(x => {
     const problems = [];
@@ -156,6 +163,7 @@ async function claimData(db, month) {
       problems.push((referralPeriods[x.authorization] || []).length ? 'No referring provider in effect on this date' : 'No referring provider');
     }
     if (!prov.npi) problems.push(`No NPI for ${x.provider}`);
+    if (notesSigned && !notesSigned.has(x.key)) problems.push('No session note signed by the provider and the parent');
     const defaults = prov.ei_default_codes || {};
     const override = overrides[x.key] || null;
     const codes = x.service ? codesFor(x.service, x.duration, defaults, override) : [];
