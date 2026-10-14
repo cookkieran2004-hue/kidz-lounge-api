@@ -52,6 +52,19 @@ async function hasDobColumn(db) {
   } catch { dobColumn = false; }
   return dobColumn;
 }
+// Offsite providers (migrations/2026-11-03_offsite_providers.sql): no
+// login, credentials only. Until it's run there are none.
+let offsiteTable = false;
+async function offsiteProviders(db) {
+  if (!offsiteTable) {
+    try {
+      const r = await db.query(`SELECT 1 FROM information_schema.tables WHERE table_name = 'OffsiteProviders'`);
+      offsiteTable = !!r.rows[0];
+    } catch { offsiteTable = false; }
+  }
+  if (!offsiteTable) return [];
+  return (await db.query('SELECT username, first_name, last_name, position FROM "OffsiteProviders" WHERE archived = false')).rows;
+}
 // '' / null clears it; otherwise it must be a YYYY-MM-DD date. undefined = invalid.
 const cleanDob = (v) => (v === '' || v === null ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : undefined);
 
@@ -111,17 +124,27 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // Credentials page (Reception, Admin, Developer; Kieran, Oct 2026).
   if (path === '/credentials/overview' && method === 'GET') {
     if (!canManage(currentUser)) return json(403, { error: CREDENTIALS_DENIED });
-    const [staffRes, credsRes] = await Promise.all([
+    const [staffRes, offsite] = await Promise.all([
       db.query('SELECT username, first_name, middle_name, last_name, preferred_name, role, provider_name, position FROM "Staff" WHERE archived = false'),
-      db.query(`SELECT c.* FROM "StaffCredentials" c JOIN "Staff" s ON s.username = c.username AND s.archived = false
-                ORDER BY c.expiration_date ASC NULLS LAST`),
+      offsiteProviders(db),
     ]);
+    const usernames = [...staffRes.rows, ...offsite].map(s => s.username);
+    const credsRes = await db.query(
+      `SELECT * FROM "StaffCredentials" WHERE username = ANY($1) ORDER BY expiration_date ASC NULLS LAST`, [usernames]
+    );
     const byUser = {};
     for (const c of credsRes.rows) (byUser[c.username] = byUser[c.username] || []).push(c);
-    const staff = staffRes.rows.map(s => ({
-      username: s.username, name: displayNameFor(s), role: s.role, position: s.position || null,
-      is_provider: !!s.provider_name, credentials: byUser[s.username] || [],
-    })).sort((a, b) => (b.is_provider - a.is_provider) || a.name.localeCompare(b.name));
+    const staff = [
+      ...staffRes.rows.map(s => ({
+        username: s.username, name: displayNameFor(s), role: s.role, position: s.position || null,
+        is_provider: !!s.provider_name, credentials: byUser[s.username] || [],
+      })),
+      // Offsite providers count as providers here (their 9 required credentials).
+      ...offsite.map(o => ({
+        username: o.username, name: displayNameFor(o), role: null, position: [o.position, 'Offsite, no login'].filter(Boolean).join(' · '),
+        is_provider: true, offsite: true, credentials: byUser[o.username] || [],
+      })),
+    ].sort((a, b) => (b.is_provider - a.is_provider) || a.name.localeCompare(b.name));
     return json(200, { staff });
   }
 
