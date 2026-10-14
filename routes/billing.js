@@ -54,6 +54,16 @@ function groupFor(program) {
   // Insurance and Other are one section, "Other" (Oct 2026).
   return 'Other';
 }
+// Who pays, for the totals under the sheet (Kieran, Oct 2026): EI, DOE,
+// Insurance (BCBS/Anthem, CIGNA, GHI, and private pay P / PP) or Other (no
+// program). The table's sections stay EI / DOE / Other.
+const INSURANCE_PROGRAMS = new Set(['BCBS/ANTHEM', 'BCBS/ANTHEN', 'CIGNA', 'GHI', 'P', 'PP']);
+function payGroupFor(program) {
+  const group = groupFor(program);
+  if (group !== 'Other') return group;
+  const parts = String(program || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  return parts.some(p => INSURANCE_PROGRAMS.has(p)) ? 'Insurance' : 'Other';
+}
 // A session's setting for the Setting column: an in-office room is C
 // (center); an offsite session is C, S or H from the setting picked with it
 // ("Offsite (School): ..." -- the frontend's makeOffsiteArea); no room, or
@@ -167,7 +177,7 @@ async function buildSheet(db, provider, month) {
     const shown = coded && code ? code : program;
     const key = `${name}\u0000${shown || ''}\u0000${mandate || ''}`;
     if (!rowMap.has(key)) {
-      rowMap.set(key, { patient_name: name, mandate, program: shown, needs_code: !!(coded && !code), group: groupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
+      rowMap.set(key, { patient_name: name, mandate, program: shown, needs_code: !!(coded && !code), group: groupFor(program), pay_group: payGroupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
     }
     return rowMap.get(key);
   };
@@ -183,7 +193,7 @@ async function buildSheet(db, provider, month) {
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
     const letter = settingOf(a.treatment_area);
     if (letter) { row.settings.add(letter); row.setting = joinSettings(row.settings); }
-    (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id, outside_hours: !!a.outside_hours });
+    (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id, outside_hours: !!a.outside_hours, duration: Number(a.duration) || 30 });
   }
   // On the caseload with no sessions this month (booked later on): their program today.
   for (const name of names) {
