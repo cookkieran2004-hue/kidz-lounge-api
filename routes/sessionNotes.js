@@ -9,6 +9,7 @@
 //   POST /session-notes/note/addenda                   { key, body } (after a signature)
 //   POST /session-notes/note/parent-link               { key } a telehealth parent signs from a secure link (7 days)
 //   POST /session-notes/note/supervisor-sign           { key, signature, license } the supervisor's co-signature
+//   POST /session-notes/note/family-copy               { key, given_on } the family got its copy (provider or office)
 //   GET  /session-notes/service-log?patient_id=&provider=&month=   the month's service log rows
 //   GET  /session-notes/cosign                         notes waiting for my co-signature (the office: everyone's)
 //   GET  /session-notes/record?patient_id=             the office: a child's signed EI records for the chart's record pack
@@ -39,6 +40,13 @@ const LINK_DAYS = 7;
 const MAX_FAILS = 5;
 const LOCK_MINUTES = 30;
 let tablesSeen = false;
+let auditSeen = false;
+async function hasAuditFixes(db) {
+  if (auditSeen) return true;
+  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiSessionNotes' AND column_name = 'group_address'`);
+  auditSeen = r.rows.length > 0;
+  return auditSeen;
+}
 let complianceSeen = false;
 async function hasCompliance(db) {
   if (complianceSeen) return true;
@@ -63,9 +71,11 @@ const monthRange = (month) => {
 // The month's EI sessions up to today (Canceled / No Show included: NYC
 // wants those documented too). Office closures and sessions while the
 // provider was out aren't sessions and are left out, as in billing.
-async function eiSessionsFor(db, { month, provider, patientName }) {
+// `through` looks past today (the compliance check's upcoming absences), and
+// `includeOut` keeps sessions during the provider's time off.
+async function eiSessionsFor(db, { month, provider, patientName, through = null, includeOut = false }) {
   const { start, end } = monthRange(month);
-  const today = clinicToday();
+  const today = through || clinicToday();
   const [appts, closures, ooo, providersRes] = await Promise.all([
     getMergedAppointments(db, { startDate: start, endDate: end < today ? end : today, provider, patientName }),
     db.query('SELECT closure_date FROM "OfficeClosures" WHERE closure_date BETWEEN $1 AND $2', [start, end]),
@@ -78,7 +88,7 @@ async function eiSessionsFor(db, { month, provider, patientName }) {
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   // An evaluation takes an evaluation report, not a session note.
   const real = appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name) && a.patient_name && a.provider && !a.is_eval
-    && (!closed.has(day10(a.appointment_date)) || a.outside_hours) && !out(a));
+    && (!closed.has(day10(a.appointment_date)) || a.outside_hours) && (includeOut || !out(a)));
   const names = [...new Set(real.map(a => a.patient_name))];
   const patients = names.length ? (await db.query('SELECT id, "Name", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows : [];
   const byName = Object.fromEntries(patients.map(p => [p.Name, p]));
@@ -97,6 +107,7 @@ async function eiSessionsFor(db, { month, provider, patientName }) {
       end_time: `${pad(Math.floor((startM + (Number(a.duration) || 30)) / 60) % 24)}:${pad((startM + (Number(a.duration) || 30)) % 60)}`,
       patient_name: a.patient_name, patient_id: p.id, provider: a.provider, service: ei.service,
       appointment_status: a.appointment_status, cancelled: ['Canceled', 'No Show'].includes(a.appointment_status), is_makeup: !!a.is_makeup,
+      provider_out: includeOut ? out(a) : undefined,
     });
   }
   return rows.sort((x, y) => x.date.localeCompare(y.date) || x.start_time.localeCompare(y.start_time));
@@ -204,6 +215,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   const mine = own && info.provider === own;
   const supervising = !!own && !mine && (note?.supervisor_name === own || (!note?.provider_signed_at && info.supervisor === own));
   if (!manager && !mine && !supervising) return json(403, { error: 'You can only see notes for your own sessions.' });
+  // Telehealth needs the parent's consent for this service (NYS); a
+  // children-only group's caregiver is the group leader (NYC group note).
+  const consent = await notes.telehealthConsentOn(db, info.patient.id, info.service, info.date);
+  const missingFor = (n) => notes.missingForSigning(n, { telehealthConsent: n && n.delivery === 'telehealth' && consent === null ? false : undefined });
 
   if (path === '/session-notes/note' && method === 'GET') {
     const { patient, ...session } = info;
@@ -213,7 +228,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       can_cosign: !!(supervising && note?.supervisor_name === own && note.provider_signed_at && !note.supervisor_signed_at),
       cosign_days: notes.COSIGN_DAYS,
       status: notes.noteStatus(note),
-      missing: notes.missingForSigning(note || { cancelled: info.cancelled }),
+      missing: missingFor(note || { cancelled: info.cancelled }),
+      consents: { telehealth: consent === undefined ? null : !!consent, email: await notes.emailConsentOn(db, info.patient.id, clinicToday()).then(c => (c === undefined ? null : !!c)) },
       today: clinicToday(),
     });
   }
@@ -231,7 +247,18 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$4 AND supervisor_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, note.id]
     )).rows[0];
     if (!note) return json(409, { error: 'This note was already co-signed. Reload the page.' });
+    if (await hasAuditFixes(db)) note = (await db.query('UPDATE "EiSessionNotes" SET supervisor_title=$1 WHERE id=$2 RETURNING *', [await notes.titleFor(db, own), note.id])).rows[0];
     return json(200, { note: shown(note), status: notes.noteStatus(note) });
+  }
+
+  // The family's copy (NYC: "as close as possible to the completed session").
+  if (path === '/session-notes/note/family-copy' && method === 'POST') {
+    if (!mine && !manager) return json(403, { error: "Only the session's provider or the office can record this." });
+    if (!note?.provider_signed_at) return json(400, { error: 'Sign the note first; the family gets the signed copy.' });
+    if (!(await hasAuditFixes(db))) return json(503, { error: 'This needs the 2026-11-08 database update. It runs with the next deploy.' });
+    const on = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.given_on || '')) ? body.given_on : clinicToday();
+    note = (await db.query('UPDATE "EiSessionNotes" SET family_copy_on=$1, family_copy_by=$2 WHERE id=$3 RETURNING *', [on, currentUser.username, note.id])).rows[0];
+    return json(200, { note: shown(note) });
   }
 
   // Everything below writes: only the session's own provider.
@@ -266,14 +293,15 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       // otherwise sign something they never saw.
       if (await hasCompliance(db)) note = await saveGroup(db, note.id, value, true);
     }
-    return json(200, { note: shown(note), status: notes.noteStatus(note), missing: notes.missingForSigning(note) });
+    return json(200, { note: shown(note), status: notes.noteStatus(note), missing: missingFor(note) });
   }
 
   if (path === '/session-notes/note/parent-sign' && method === 'POST') {
     if (!note) return json(400, { error: 'Save the note before the parent signs.' });
     if (note.cancelled) return json(400, { error: "A canceled session doesn't need the parent's signature." });
     if (note.parent_signed_at) return json(409, { error: 'The parent has already signed this note.' });
-    const missing = notes.missingForSigning(note);
+    if (note.group_type === 'group') return json(400, { error: 'In a children-only group you sign for the caregiver (as the group leader) when you sign the note.' });
+    const missing = missingFor(note);
     if (missing.length) return json(400, { error: `Finish the note before the parent signs: ${missing[0]}.`, missing });
     const b = body || {};
     const name = String(b.parent_name || '').trim().slice(0, 200);
@@ -294,7 +322,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/session-notes/note/provider-sign' && method === 'POST') {
     if (!note) return json(400, { error: 'Save the note before signing it.' });
     if (note.provider_signed_at) return json(409, { error: 'You have already signed this note.' });
-    const missing = notes.missingForSigning(note);
+    const missing = missingFor(note);
     if (missing.length) return json(400, { error: `Finish the note before signing: ${missing[0]}.`, missing });
     const b = body || {};
     if (!notes.validSignature(b.signature)) return json(400, { error: 'Sign in the box.' });
@@ -310,6 +338,15 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (info.supervisor && (await hasCompliance(db))) {
       note = (await db.query('UPDATE "EiSessionNotes" SET supervisor_name=$1 WHERE id=$2 RETURNING *', [info.supervisor, note.id])).rows[0];
     }
+    // A children-only group: the group leader is the caregiver and signs the
+    // note and the service log as such (NYC Group Session Note instructions).
+    if (note.group_type === 'group' && !note.cancelled && !note.parent_signed_at) {
+      note = (await db.query(
+        `UPDATE "EiSessionNotes" SET parent_name=$1, parent_relationship='Group leader (qualified personnel)', parent_note_signature=$2, parent_log_signature=$2,
+           parent_signed_at=now(), parent_signed_via='group_leader' WHERE id=$3 AND parent_signed_at IS NULL RETURNING *`,
+        [info.header.interventionist, b.signature, note.id]
+      )).rows[0] || note;
+    }
     return json(200, { note: shown(note), status: notes.noteStatus(note) });
   }
 
@@ -319,7 +356,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (note.cancelled) return json(400, { error: "A canceled session doesn't need the parent's signature." });
     if (note.parent_signed_at) return json(409, { error: 'The parent has already signed this note.' });
     if (note.delivery !== 'telehealth') return json(400, { error: 'A signing link is for telehealth sessions. For an in-person session the parent signs on your device.' });
-    const missing = notes.missingForSigning(note);
+    // The link goes by email, which needs the parent's written consent (NYS:
+    // texting families isn't an approved way to share information).
+    const emailOk = await notes.emailConsentOn(db, info.patient.id, clinicToday());
+    if (emailOk === null) return json(400, { error: "The parent's email consent isn't on file (chart → IFSP tab). Get it signed before emailing a signing link, or have them sign at the next visit." });
+    const missing = missingFor(note);
     if (missing.length) return json(400, { error: `Finish the note before sending it: ${missing[0]}.`, missing });
     const token = newToken();
     await db.query(
@@ -345,11 +386,14 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
 // The group-session fields (and, on a change, cancelling an open link).
 async function saveGroup(db, id, v, changed) {
-  return (await db.query(
+  const row = (await db.query(
     `UPDATE "EiSessionNotes" SET group_type=$1, group_children=$2, group_duration=$3, group_site=$4, aide_name=$5, aide_notes=$6,
        parent_link_hash=CASE WHEN $7::boolean THEN NULL ELSE parent_link_hash END WHERE id=$8 RETURNING *`,
     [v.group_type, v.group_children, v.group_duration, v.group_site, v.aide_name, v.aide_notes, !!changed, id]
   )).rows[0];
+  if (!(await hasAuditFixes(db))) return row;
+  return (await db.query('UPDATE "EiSessionNotes" SET group_location=$1, group_location_other=$2, group_address=$3 WHERE id=$4 RETURNING *',
+    [v.group_location, v.group_location_other, v.group_address, id])).rows[0];
 }
 
 // ---------- Public: a telehealth parent signs from a link ----------

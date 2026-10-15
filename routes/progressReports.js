@@ -186,7 +186,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, { reports: rows });
   }
 
-  const m = path.match(/^\/progress-reports\/(\d+)(?:\/(parent-sign|provider-sign|supervisor-sign|addenda|office|sent))?$/);
+  const m = path.match(/^\/progress-reports\/(\d+)(?:\/(parent-sign|provider-sign|supervisor-sign|addenda|office|sent|family-copy))?$/);
   if (!m) return json(404, { error: 'Not found.' });
   const [, idText, step] = m;
   let { report, addenda } = await loadReport(db, Number(idText));
@@ -241,7 +241,19 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$4 AND supervisor_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, report.id]
     )).rows[0];
     if (!row) return json(409, { error: 'This report was already co-signed. Reload the page.' });
+    await db.query('UPDATE "EiProgressReports" SET supervisor_title=$1 WHERE id=$2', [await notesLib.titleFor(db, own), report.id]).catch(() => {});
     return json(200, { status: pr.reportStatus(row) });
+  }
+
+  // The family's copy (NYC: "the family should receive a copy of all
+  // completed progress notes").
+  if (step === 'family-copy' && method === 'POST') {
+    if (!mine && !manager) return json(403, { error: "Only the report's provider or the office can record this." });
+    if (!report.provider_signed_at) return json(400, { error: 'Sign the report first; the family gets the signed copy.' });
+    const on = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.given_on || '')) ? body.given_on : clinicToday();
+    const r = await db.query('UPDATE "EiProgressReports" SET family_copy_on=$1, family_copy_by=$2 WHERE id=$3', [on, currentUser.username, report.id]).catch(() => null);
+    if (!r) return json(503, { error: 'This needs the 2026-11-08 database update. It runs with the next deploy.' });
+    return json(200, { family_copy_on: on });
   }
 
   // Everything below is the provider's own.

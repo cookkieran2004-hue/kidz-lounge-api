@@ -264,6 +264,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // who deleted it.
   if (!action && method === 'DELETE') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Only Admins and Developers can delete forms.' });
+    // PedsDesk's EI records: a completed form (a signed consent) is part of
+    // the child's record and is kept six years (10 NYCRR 69-4.26).
+    if (require('../lib/features').featureOn('ei') && r.status === 'completed') {
+      return json(409, { error: 'A completed form is part of the child\'s record and is kept for six years, so it can\'t be deleted.' });
+    }
     if (r.document_id) {
       const doc = (await db.query('SELECT id FROM "PatientDocuments" WHERE id::text=$1 AND patient_id::text=$2', [String(r.document_id), String(r.patient_id)])).rows[0];
       if (doc) await deleteDocument(db, doc.id);

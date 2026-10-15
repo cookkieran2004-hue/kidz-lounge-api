@@ -7,6 +7,7 @@
 //   POST /eval-reports/report/provider-sign        { key, signature, license }
 //   POST /eval-reports/report/supervisor-sign      { key, signature, license }
 //   POST /eval-reports/report/addenda              { key, body }
+//   POST /eval-reports/report/family-copy          { key, given_on } the family got its copy
 //
 // One report per evaluation appointment (Appointments.is_eval, keyed
 // 'appt:<id>' like session notes). A canceled or no-show evaluation needs
@@ -136,6 +137,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       header, report, addenda,
       status: ev.reportStatus(report || { eval_date: evalDate }, today),
       missing: ev.missingForSigning(report),
+      warnings: ev.warningsFor(report),
       can_write: !!mine,
       can_cosign: !!(supervising && report?.provider_signed_at && !report.supervisor_signed_at),
       license_hint: report?.provider_license ? null : await notesLib.licenseFor(db, appt.provider),
@@ -157,7 +159,18 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$4 AND supervisor_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, report.id]
     )).rows[0];
     if (!row) return json(409, { error: 'This report was already co-signed. Reload the page.' });
+    await db.query('UPDATE "EiEvalReports" SET supervisor_title=$1 WHERE id=$2', [await notesLib.titleFor(db, own), report.id]).catch(() => {});
     return json(200, { status: ev.reportStatus(row, today) });
+  }
+
+  // The family's copy (PHL 2544(7): the parent gets the evaluation summary).
+  if (path === '/eval-reports/report/family-copy' && method === 'POST') {
+    if (!mine && !manager) return json(403, { error: "Only the evaluator or the office can record this." });
+    if (!report?.provider_signed_at) return json(400, { error: 'Sign the report first; the family gets the signed copy.' });
+    const on = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.given_on || '')) ? body.given_on : today;
+    const r = await db.query('UPDATE "EiEvalReports" SET family_copy_on=$1, family_copy_by=$2 WHERE id=$3', [on, currentUser.username, report.id]).catch(() => null);
+    if (!r) return json(503, { error: 'This needs the 2026-11-08 database update. It runs with the next deploy.' });
+    return json(200, { family_copy_on: on });
   }
 
   if (!mine) return json(403, { error: "Only the evaluation's provider can write and sign its report." });
@@ -178,7 +191,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         [evalDate, v.details, JSON.stringify(v.instruments), v.domains, report.id]
       )).rows[0];
     }
-    return json(200, { report: { ...report, eval_date: day10(report.eval_date) }, status: ev.reportStatus(report, today), missing: ev.missingForSigning(report) });
+    return json(200, { report: { ...report, eval_date: day10(report.eval_date) }, status: ev.reportStatus(report, today), missing: ev.missingForSigning(report), warnings: ev.warningsFor(report) });
   }
 
   if (path === '/eval-reports/report/provider-sign' && method === 'POST') {

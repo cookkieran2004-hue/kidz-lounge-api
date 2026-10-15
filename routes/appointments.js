@@ -6,6 +6,30 @@ const { isHold } = require('../lib/caseload');
 const { applyCancelReason } = require('../lib/cancelReason');
 const { applyOutsideHours } = require('../lib/outsideHours');
 const { applyAbsenceReason } = require('../lib/absenceReason');
+const { signedRecordsFor } = require('../lib/sessionNotes');
+
+// PedsDesk's EI records (the "ei" feature): a session with a signed session
+// note or evaluation report is part of the child's record (kept six years,
+// and the service log must match it), so it can't be deleted, cut off or
+// moved. Empty everywhere else.
+const keyOfRow = (row) => (row.exception_of_series_id
+  ? `series:${row.exception_of_series_id}:${String(row.exception_occurrence_date).slice(0, 10)}` : `appt:${row.id}`);
+async function signedLock(db, row) {
+  const found = await signedRecordsFor(db, [keyOfRow(row)]);
+  return found[0] ? json(409, { error: `This session has a signed ${found[0].kind}, so it can't be deleted, moved or re-timed. Correct the record with an addendum instead.`, locked: true }) : null;
+}
+// Signed records for a weekly series' occurrences on or after a date.
+async function signedSeriesFrom(db, seriesId, fromDate) {
+  const { featureOn } = require('../lib/features');
+  if (!featureOn('ei')) return null;
+  const t = (await db.query(`SELECT to_regclass('"EiSessionNotes"') AS n`)).rows[0];
+  if (!t.n) return null;
+  const r = (await db.query(
+    `SELECT session_key FROM "EiSessionNotes" WHERE session_key LIKE $1 AND split_part(session_key, ':', 3) >= $2
+       AND (provider_signed_at IS NOT NULL OR parent_signed_at IS NOT NULL) ORDER BY session_key LIMIT 1`, [`series:${seriesId}:%`, fromDate]
+  )).rows[0];
+  return r ? json(409, { error: `Sessions of this series from ${r.session_key.split(':')[2]} on have signed session notes, so they can't be removed. End the series after the last signed session instead.`, locked: true }) : null;
+}
 
 // The per-session details, after any appointment row is written. The
 // absence reason comes after the cancel reason: a closure reason clears it.
@@ -161,6 +185,16 @@ async function handle(ctx) {
     const existingRes = await db.query('SELECT * FROM "Appointments" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Appointment not found.' });
     const existing = existingRes.rows[0];
+    // A signed EI record: the session's facts stay as signed (room and
+    // comments may still change).
+    const day = (v) => (v ? String(v).slice(0, 10) : v);
+    const missed = (st) => MISSED_STATUSES.includes(st);
+    const norm = (k, v) => (k === 'appointment_time' ? String(v ?? '').slice(0, 5) : String(v ?? ''));
+    const moved = ['patient_name', 'provider', 'appointment_time', 'duration']
+      .some(k => norm(k, mergedField(body, k, existing)) !== norm(k, existing[k]))
+      || day(mergedField(body, 'appointment_date', existing)) !== day(existing.appointment_date)
+      || missed(mergedField(body, 'appointment_status', existing)) !== missed(existing.appointment_status);
+    if (moved) { const lock = await signedLock(db, existing); if (lock) return lock; }
     // Any field omitted from the body keeps its current value instead of
     // being wiped -- this is what makes it safe for a caller like "cancel
     // just this occurrence" to send only { appointment_status: 'Canceled' }
@@ -241,6 +275,8 @@ async function handle(ctx) {
 
   if (path.match(/^\/appointments\/[^/]+$/) && method === 'DELETE') {
     const id = path.split('/').pop();
+    const row = (await db.query('SELECT * FROM "Appointments" WHERE id::text=$1', [id])).rows[0];
+    if (row) { const lock = await signedLock(db, row); if (lock) return lock; }
     await db.query('DELETE FROM "Appointments" WHERE id=$1', [id]);
     return json(200, { deleted: true });
   }
@@ -266,6 +302,8 @@ async function handle(ctx) {
     const seriesId = path.split('/')[2];
     const { end_date } = body;
     if (!end_date) return json(400, { error: 'end_date is required.' });
+    { const next = new Date(`${String(end_date).slice(0, 10)}T00:00:00Z`); next.setUTCDate(next.getUTCDate() + 1);
+      const lock = await signedSeriesFrom(db, seriesId, next.toISOString().slice(0, 10)); if (lock) return lock; }
     const result = await db.query('UPDATE "RecurringSeries" SET end_date=$1, updated_at=now() WHERE id=$2 RETURNING *', [end_date, seriesId]);
     if (!result.rows[0]) return json(404, { error: 'Series not found.' });
     return json(200, result.rows[0]);
@@ -286,6 +324,7 @@ async function handle(ctx) {
     const seriesId = path.split('/')[2];
     const { from_date } = body;
     if (!from_date) return json(400, { error: 'from_date is required.' });
+    { const lock = await signedSeriesFrom(db, seriesId, String(from_date).slice(0, 10)); if (lock) return lock; }
     const result = await db.query(
       `UPDATE "Appointments" SET deleted=true, updated_at=now()
        WHERE exception_of_series_id=$1 AND exception_occurrence_date >= $2 RETURNING id`,
@@ -309,6 +348,12 @@ async function handle(ctx) {
     const seriesRes = await db.query('SELECT * FROM "RecurringSeries" WHERE id=$1', [seriesId]);
     const series = seriesRes.rows[0];
     if (!series) return json(404, { error: 'Series not found.' });
+    // Deleting or moving one occurrence that already has a signed EI record.
+    if (deleted || (appointment_date && appointment_date !== occurrence_date) || (appointment_time && String(appointment_time).slice(0, 5) !== String(series.appointment_time).slice(0, 5))
+      || (provider && provider !== series.provider) || (patient_name && patient_name !== series.patient_name)) {
+      const lock = await signedLock(db, { exception_of_series_id: seriesId, exception_occurrence_date: occurrence_date });
+      if (lock) return lock;
+    }
 
     const result = await db.query(
       `INSERT INTO "Appointments"
@@ -337,6 +382,8 @@ async function handle(ctx) {
   // next load.
   if (path.match(/^\/appointments\/[^/]+\/mark-deleted$/) && method === 'PUT') {
     const id = path.split('/')[2];
+    const row = (await db.query('SELECT * FROM "Appointments" WHERE id::text=$1', [id])).rows[0];
+    if (row) { const lock = await signedLock(db, row); if (lock) return lock; }
     const result = await db.query('UPDATE "Appointments" SET deleted=true WHERE id=$1 RETURNING *', [id]);
     if (!result.rows[0]) return json(404, { error: 'Appointment not found.' });
     return json(200, result.rows[0]);

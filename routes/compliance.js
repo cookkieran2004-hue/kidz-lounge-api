@@ -13,7 +13,11 @@
 //   authorizations EI-Hub authorizations ending soon with nothing after them
 //   ifsps          IFSPs ending soon with no next one entered
 //   credentials    staff credentials expired or expiring
-// Nothing here is stored: it's worked out from the records each time.
+//   orders         PT / OT orders (prescriptions) missing or expiring (NYC citation #5)
+//   starts         services not started within 14 days of the authorization (NYC citation #1)
+//   absences       a provider's planned absence the family and SC must hear about 5 business days ahead (NYC citation #4)
+// Nothing here is stored but the absence notices:
+//   POST /compliance/absence-notices { provider, absence_date, patient_id }  the family and SC were told
 const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { featureOn } = require('../lib/features');
@@ -27,7 +31,14 @@ const notesLib = require('../lib/sessionNotes');
 // (the agency's rule; NYC wants notes written at the session).
 const LOOK_AHEAD_DAYS = 30;
 const TRANSITION_LOOK_AHEAD_DAYS = 60;
-const NOTE_LATE_DAYS = 2;
+// NYC: notes are written "contemporaneously or as close as possible to the
+// session": one not done by the next day is late.
+const NOTE_LATE_DAYS = 1;
+// NYC citation #1: services start within 14 calendar days of the authorization.
+const START_DAYS = 14;
+// NYC citation #4: 5 business days' notice of a provider's planned absence.
+const ABSENCE_NOTICE_BUSINESS_DAYS = 5;
+const ORDER_SERVICES = ['PT', 'OT'];
 
 const day10 = (v) => (v ? String(v).slice(0, 10) : null);
 // Dates in the text as staff read them: "Nov 22, 2026".
@@ -187,14 +198,132 @@ async function credentialsSection(db, today) {
   });
 }
 
-async function handle({ path, method, db, currentUser }) {
-  if (path !== '/compliance') return null;
+// PT and OT need a physician's or NP's order in the child's file (10 NYCRR
+// 69-4.11(a)(10)), shown here from the patient's RX dates.
+async function ordersSection(db, today) {
+  const rows = (await db.query(
+    `SELECT DISTINCT p.id, p."Name", p."RX_Date", p."RX_Expiration", pp.service
+     FROM "Patients" p JOIN "PatientPrograms" pp ON pp.patient_id = p.id
+     WHERE p."Status" IS DISTINCT FROM 'Off Program' AND pp.service = ANY($1) AND pp.end_date IS NULL`, [ORDER_SERVICES]
+  ).catch(() => ({ rows: [] }))).rows;
+  const byKid = new Map();
+  for (const r of rows) {
+    if (!byKid.has(r.id)) byKid.set(r.id, { ...r, services: [] });
+    byKid.get(r.id).services.push(r.service);
+  }
+  const out = [];
+  const soon = ifspLib.addDays(today, LOOK_AHEAD_DAYS);
+  for (const k of byKid.values()) {
+    const exp = day10(k.RX_Expiration);
+    const what = `${k.services.sort().join(' / ')} order (prescription)`;
+    const base = { patient_name: k.Name, patient_id: k.id, provider: null, href: null, kind: 'order' };
+    if (!k.RX_Date) out.push({ ...base, date: null, text: `${what} not on file`, severity: 'danger' });
+    else if (exp && exp < today) out.push({ ...base, date: exp, text: `${what} expired ${nice(exp)}`, severity: 'danger' });
+    else if (exp && exp <= soon) out.push({ ...base, date: exp, text: `${what} expires ${nice(exp)}`, severity: 'warning' });
+  }
+  return out;
+}
+
+// Each EI authorization that began in the last 90 days: its service should
+// start within 14 days (a late start needs a documented reason and the SC told).
+async function startsSection(db, today) {
+  if (!(await exists(db, 'EiAuthorizations'))) return [];
+  const since = ifspLib.addDays(today, -90);
+  const auths = (await db.query(
+    `SELECT a.authorization_number, a.service, a.start_date, p.id AS patient_id, p."Name" AS patient_name
+     FROM "EiAuthorizations" a JOIN "Patients" p ON p.id = a.patient_id
+     WHERE p."Status" IS DISTINCT FROM 'Off Program' AND a.start_date BETWEEN $1 AND $2
+       AND COALESCE(a.enrollment_status, '') NOT ILIKE '%suspend%'`, [since, today]
+  )).rows;
+  if (!auths.length) return [];
+  // Before the agency's first session in the app there's nothing to check
+  // a start against.
+  const first = (await db.query(`SELECT LEAST((SELECT min(appointment_date) FROM "Appointments" WHERE deleted = false), (SELECT min(start_date) FROM "RecurringSeries")) AS d`)).rows[0]?.d;
+  const recordsFrom = day10(first) || today;
+  const { eiSessionsFor } = require('./sessionNotes');
+  const sessions = [];
+  for (let m = since.slice(0, 7); m <= today.slice(0, 7); m = ifspLib.addMonths(`${m}-01`, 1).slice(0, 7)) {
+    sessions.push(...await eiSessionsFor(db, { month: m, provider: null, patientName: null }));
+  }
+  const out = [];
+  for (const a of auths) {
+    const start = day10(a.start_date);
+    if (start < recordsFrom) continue;
+    const first = sessions.filter(s => s.patient_id === a.patient_id && s.service === a.service && !s.cancelled && s.date >= start)
+      .sort((x, y) => x.date.localeCompare(y.date))[0];
+    // An earlier session of the same service: services were already going
+    // (a renewed authorization), not a new start.
+    const before = sessions.some(s => s.patient_id === a.patient_id && s.service === a.service && !s.cancelled && s.date < start);
+    if (before) continue;
+    const due = ifspLib.addDays(start, START_DAYS);
+    const base = { patient_name: a.patient_name, patient_id: a.patient_id, provider: first?.provider || null, href: null, kind: 'start' };
+    if (!first && today > due) out.push({ ...base, date: due, text: `${a.service} hasn't started: authorization ${a.authorization_number} began ${nice(start)} (due by ${nice(due)}). Tell the SC why.`, severity: 'danger' });
+    else if (!first) out.push({ ...base, date: due, text: `${a.service} must start by ${nice(due)} (authorization ${a.authorization_number})`, severity: 'warning' });
+    else if (first.date > due) out.push({ ...base, date: first.date, text: `${a.service} started ${nice(first.date)}, ${Math.round((new Date(first.date) - new Date(start)) / 86400000)} days after the authorization: the reason and SC notice must be documented`, severity: 'warning' });
+  }
+  return out;
+}
+
+const minusBusinessDays = (date, n) => { let d = date; let left = n; while (left > 0) { d = ifspLib.addDays(d, -1); const wd = new Date(`${d}T00:00:00Z`).getUTCDay(); if (wd !== 0 && wd !== 6) left--; } return d; };
+
+// Upcoming provider time off (not lunch or meetings) that falls on EI
+// sessions: the family and service coordinator must be told 5 business days
+// ahead, with the date services resume (10 NYCRR 69-4.9(g)(2)(ii)).
+async function absencesSection(db, today) {
+  const until = ifspLib.addDays(today, 30);
+  const { getMergedOOO } = require('../lib/recurring');
+  const ooo = (await getMergedOOO(db, { startDate: ifspLib.addDays(today, 1), endDate: until }))
+    .filter(o => !['Lunch', 'Meeting'].includes(o.type));
+  if (!ooo.length) return [];
+  const { eiSessionsFor } = require('./sessionNotes');
+  const sessions = [];
+  for (let m = today.slice(0, 7); m <= until.slice(0, 7); m = ifspLib.addMonths(`${m}-01`, 1).slice(0, 7)) {
+    sessions.push(...(await eiSessionsFor(db, { month: m, provider: null, patientName: null, through: until, includeOut: true })).filter(s => s.date > today && s.provider_out));
+  }
+  // Only real absences (time off), not lunch or meetings.
+  const mins = (t) => { const [hh, mm] = String(t).split(':').map(Number); return hh * 60 + (mm || 0); };
+  const away = (s) => ooo.some(o => o.provider === s.provider && day10(o.ooo_date) === s.date
+    && mins(o.start_time) < mins(s.end_time) && mins(s.start_time) < mins(o.end_time));
+  const notices = (await exists(db, 'EiAbsenceNotices'))
+    ? new Set((await db.query('SELECT provider, absence_date, patient_id FROM "EiAbsenceNotices" WHERE absence_date > $1', [today])).rows.map(r => `${r.provider}|${day10(r.absence_date)}|${r.patient_id}`))
+    : new Set();
+  const out = [];
+  const seen = new Set();
+  for (const s of sessions) {
+    if (!away(s)) continue;
+    const k = `${s.provider}|${s.date}|${s.patient_id}`;
+    if (seen.has(k) || notices.has(k)) continue;
+    seen.add(k);
+    const by = minusBusinessDays(s.date, ABSENCE_NOTICE_BUSINESS_DAYS);
+    out.push({
+      patient_name: s.patient_name, patient_id: s.patient_id, provider: s.provider, date: by, href: null, kind: 'absence',
+      text: `${s.provider} is out ${nice(s.date)}: tell the family and SC by ${nice(by)} (with the date services resume)`,
+      severity: by < today ? 'danger' : 'warning',
+      notice: { provider: s.provider, absence_date: s.date, patient_id: s.patient_id },
+    });
+  }
+  return out;
+}
+
+async function handle({ path, method, body, db, currentUser }) {
+  if (path !== '/compliance' && path !== '/compliance/absence-notices') return null;
   if (!featureOn('ei')) return json(404, { error: 'Not available at this clinic.' });
-  if (method !== 'GET') return json(405, { error: 'Not supported.' });
   if (!canManage(currentUser)) return json(403, { error: 'The compliance dashboard is for Reception, Admins and Developers.' });
+  if (path === '/compliance/absence-notices') {
+    if (method !== 'POST') return json(405, { error: 'Not supported.' });
+    if (!(await exists(db, 'EiAbsenceNotices'))) return json(503, { error: 'This needs the 2026-11-08 database update. It runs with the next deploy.' });
+    const b = body || {};
+    if (!b.provider || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.absence_date || '')) || !/^[0-9a-f-]{36}$/i.test(String(b.patient_id || ''))) return json(400, { error: 'Choose the absence and the child.' });
+    await db.query(
+      `INSERT INTO "EiAbsenceNotices" (provider, absence_date, patient_id, notified_on, notified_by) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (provider, absence_date, patient_id) DO NOTHING`,
+      [b.provider, b.absence_date, b.patient_id, clinicToday(), currentUser.username]
+    );
+    return json(201, { ok: true });
+  }
+  if (method !== 'GET') return json(405, { error: 'Not supported.' });
   const today = clinicToday();
   const sections = {};
-  const parts = { notes: notesSection, reports: reportsSection, evals: evalsSection, makeups: makeupsSection, transitions: transitionsSection, authorizations: authorizationsSection, ifsps: ifspsSection, credentials: credentialsSection };
+  const parts = { notes: notesSection, reports: reportsSection, evals: evalsSection, starts: startsSection, absences: absencesSection, orders: ordersSection, makeups: makeupsSection, transitions: transitionsSection, authorizations: authorizationsSection, ifsps: ifspsSection, credentials: credentialsSection };
   for (const [name, fn] of Object.entries(parts)) {
     // One section failing (a migration not run yet) never hides the rest.
     try {
