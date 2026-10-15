@@ -82,6 +82,7 @@ const text = (v, max = 60) => {
 // Providers has no archived column: a provider is archived when their staff
 // account is (the same rule as routes/providers.js).
 const PROVIDER_COLUMNS = `p.id, p."Name", p.first_name, p.last_name, p.specialty, p.npi, p.ei_first_name, p.ei_last_name, p.ei_default_codes,
+  to_jsonb(p)->>'supervisor_name' AS supervisor_name,
   (EXISTS (SELECT 1 FROM "Staff" s WHERE s.provider_name = p."Name" AND s.archived = true)
    AND NOT EXISTS (SELECT 1 FROM "Staff" s WHERE s.provider_name = p."Name" AND s.archived = false)) AS archived`;
 const disciplinesOf = (specialty) => String(specialty || '').split(/[,/]/).map(x => x.trim().toUpperCase()).filter(Boolean);
@@ -653,6 +654,16 @@ async function handle(ctx) {
       'UPDATE "Providers" SET npi=$1, ei_first_name=$2, ei_last_name=$3, ei_default_codes=$4 WHERE "Name"=$5',
       [npi || null, text(b.ei_first_name, 35), text(b.ei_last_name, 60), Object.keys(codes).length ? JSON.stringify(codes) : null, name]
     );
+    // PedsDesk ("ei"): who co-signs their session notes and progress
+    // reports, for a provider working under supervision. Saved only when sent.
+    if (featureOn('ei') && Object.prototype.hasOwnProperty.call(b, 'supervisor_name')) {
+      const sup = text(b.supervisor_name, 200);
+      if (sup === name) return json(400, { error: "A provider can't be their own supervisor." });
+      if (sup && !(await db.query('SELECT 1 FROM "Providers" WHERE "Name"=$1', [sup])).rows.length) return json(400, { error: 'Choose the supervisor from the list.' });
+      const col = (await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Providers' AND column_name = 'supervisor_name'`)).rows.length;
+      if (!col) return json(409, { error: 'Supervisors need the 2026-11-07 database update. It runs with the next deploy.' });
+      await db.query('UPDATE "Providers" SET supervisor_name=$1 WHERE "Name"=$2', [sup, name]);
+    }
     return json(200, (await db.query(`SELECT ${PROVIDER_COLUMNS} FROM "Providers" p WHERE p."Name"=$1`, [name])).rows[0]);
   }
 

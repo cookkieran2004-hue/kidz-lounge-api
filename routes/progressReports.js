@@ -8,13 +8,16 @@
 //   POST /progress-reports/:id/parent-sign     { parent_name, relationship, signature }
 //   POST /progress-reports/:id/provider-sign   { signature, license }
 //   POST /progress-reports/:id/addenda         { body }
+//   POST /progress-reports/:id/supervisor-sign { signature, license }  the supervisor's co-signature (before the office approves)
+//   GET  /progress-reports/cosign              reports waiting for my co-signature
 //   POST /progress-reports/:id/office          { action: 'approve' | 'return', comment }   (canManage)
 //   POST /progress-reports/:id/sent            { sent_on }                                  (canManage)
 //
 // Who: the report's own provider writes, gets the parent's signature on
 // their device, signs and adds addenda; Reception, Admins and Developers
 // see everything, approve or return, and mark reports sent. Providers see
-// only their own.
+// only their own. A provider's supervisor (Providers.supervisor_name, set
+// on the report when the provider signs) reads and co-signs it.
 const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { featureOn } = require('../lib/features');
@@ -27,6 +30,13 @@ const { eiSessionsFor } = require('./sessionNotes');
 
 const MIGRATION = 'Progress reports need the 2026-11-06 database update. It runs with the next deploy.';
 let tablesSeen = false;
+let complianceSeen = false;
+async function hasCompliance(db) {
+  if (complianceSeen) return true;
+  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiProgressReports' AND column_name = 'supervisor_name'`);
+  complianceSeen = r.rows.length > 0;
+  return complianceSeen;
+}
 async function hasTables(db) {
   if (tablesSeen) return true;
   const r = await db.query(`SELECT to_regclass('"EiProgressReports"') AS a, to_regclass('"EiProgressReportAddenda"') AS b, to_regclass('"EiSessionNotes"') AS c`);
@@ -125,7 +135,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (patientId) { params.push(patientId); where += ` AND r.patient_id::text = $${params.length}`; }
     const reports = (await db.query(
       `SELECT r.id, r.patient_id, p."Name" AS patient_name, r.ifsp_id, r.provider, r.service, r.report_type, r.ifsp_start, r.ifsp_end, r.due_date,
-              r.parent_signed_at, r.provider_signed_at, r.office_status, r.office_comment, r.sent_on
+              r.parent_signed_at, r.provider_signed_at, r.office_status, r.office_comment, r.sent_on${await hasCompliance(db) ? ', r.supervisor_name, r.supervisor_signed_at' : ''}
        FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id ${where} ORDER BY r.due_date NULLS LAST, r.id`, params
     )).rows;
     const key = (x) => `${x.patient_id}|${x.ifsp_id}|${x.provider}|${x.service}|${x.report_type}`;
@@ -165,13 +175,25 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(201, { id: row.id });
   }
 
-  const m = path.match(/^\/progress-reports\/(\d+)(?:\/(parent-sign|provider-sign|addenda|office|sent))?$/);
+  if (path === '/progress-reports/cosign' && method === 'GET') {
+    if (!(await hasCompliance(db))) return json(200, { reports: [] });
+    const rows = (await db.query(
+      `SELECT r.id, r.patient_id, p."Name" AS patient_name, r.provider, r.service, r.report_type, r.due_date, r.supervisor_name, r.provider_signed_at
+       FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id
+       WHERE r.supervisor_name IS NOT NULL AND r.supervisor_signed_at IS NULL AND r.provider_signed_at IS NOT NULL
+         AND ($1::text IS NULL OR r.supervisor_name = $1) ORDER BY r.provider_signed_at`, [manager && !qs.mine ? null : own]
+    )).rows.map(r => ({ ...r, due_date: day10(r.due_date) }));
+    return json(200, { reports: rows });
+  }
+
+  const m = path.match(/^\/progress-reports\/(\d+)(?:\/(parent-sign|provider-sign|supervisor-sign|addenda|office|sent))?$/);
   if (!m) return json(404, { error: 'Not found.' });
   const [, idText, step] = m;
   let { report, addenda } = await loadReport(db, Number(idText));
   if (!report) return json(404, { error: 'That progress report was not found.' });
   const mine = own && report.provider === own;
-  if (!manager && !mine) return json(403, { error: 'You can only see your own progress reports.' });
+  const supervising = !!own && !mine && report.supervisor_name === own;
+  if (!manager && !mine && !supervising) return json(403, { error: 'You can only see your own progress reports.' });
   const locked = !!(report.provider_signed_at || report.parent_signed_at);
 
   if (!step && method === 'GET') {
@@ -180,6 +202,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       header: report.header || await headerFor(db, report),
       addenda, status: pr.reportStatus(report), missing: pr.missingForSigning(report),
       can_write: !!mine, can_office: manager, today: clinicToday(),
+      can_cosign: !!(supervising && report.provider_signed_at && !report.supervisor_signed_at),
       license_hint: report.provider_license ? null : await notesLib.licenseFor(db, report.provider),
     });
   }
@@ -187,6 +210,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (step === 'office' && method === 'POST') {
     if (!manager) return json(403, { error: 'Only Reception, Admins and Developers can approve progress reports.' });
     if (!report.provider_signed_at || !report.parent_signed_at) return json(400, { error: 'The provider and the parent both sign before the office reviews it.' });
+    if (body?.action === 'approve' && report.supervisor_name && !report.supervisor_signed_at) return json(400, { error: `${report.supervisor_name} (the provider's supervisor) co-signs before the office approves it.` });
     const action = body?.action;
     const comment = String(body?.comment || '').trim().slice(0, 3000);
     if (!['approve', 'return'].includes(action)) return json(400, { error: 'Approve or return the report.' });
@@ -202,6 +226,22 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const sentOn = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.sent_on || '')) ? body.sent_on : clinicToday();
     await db.query('UPDATE "EiProgressReports" SET sent_on=$1, sent_by=$2, updated_at=now() WHERE id=$3', [sentOn, currentUser.username, report.id]);
     return json(200, { status: 'sent', sent_on: sentOn });
+  }
+
+  if (step === 'supervisor-sign' && method === 'POST') {
+    if (!supervising) return json(403, { error: "Only the provider's supervisor can co-sign this report." });
+    if (!report.provider_signed_at) return json(400, { error: 'The provider signs the report first.' });
+    if (report.supervisor_signed_at) return json(409, { error: 'You have already co-signed this report.' });
+    const b = body || {};
+    if (!notesLib.validSignature(b.signature)) return json(400, { error: 'Sign in the box.' });
+    const license = String(b.license || (await notesLib.licenseFor(db, own)) || '').trim().slice(0, 60);
+    if (!license) return json(400, { error: 'Enter your license #.' });
+    const row = (await db.query(
+      `UPDATE "EiProgressReports" SET supervisor_signature=$1, supervisor_license=$2, supervisor_signed_at=now(), supervisor_signed_by=$3, updated_at=now()
+       WHERE id=$4 AND supervisor_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, report.id]
+    )).rows[0];
+    if (!row) return json(409, { error: 'This report was already co-signed. Reload the page.' });
+    return json(200, { status: pr.reportStatus(row) });
   }
 
   // Everything below is the provider's own.
@@ -249,6 +289,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$5 AND provider_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, header, report.id]
     )).rows[0];
     if (!row) return json(409, { error: 'This report was already signed. Reload the page.' });
+    const supervisor = await supervisorOf(db, report.provider);
+    if (supervisor) {
+      const withSup = (await db.query('UPDATE "EiProgressReports" SET supervisor_name=$1 WHERE id=$2 RETURNING *', [supervisor, report.id])).rows[0];
+      return json(200, { status: pr.reportStatus(withSup) });
+    }
     return json(200, { status: pr.reportStatus(row) });
   }
 
@@ -265,4 +310,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   return json(405, { error: 'Not supported.' });
 }
 
-module.exports = { handle };
+// The provider's supervisor (Providers.supervisor_name), when they have one.
+async function supervisorOf(db, provider) {
+  if (!(await hasCompliance(db))) return null;
+  return (await db.query('SELECT supervisor_name FROM "Providers" WHERE "Name"=$1', [provider])).rows[0]?.supervisor_name || null;
+}
+
+module.exports = { handle, dueReports };

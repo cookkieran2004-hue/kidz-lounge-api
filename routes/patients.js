@@ -351,6 +351,21 @@ async function handle({ path, method, qs, body, db, currentUser }) {
         blocked: true,
       });
     }
+
+    // PedsDesk's EI records: a signed session note, progress report or
+    // evaluation report is a legal record and its database lock would stop
+    // the delete with a raw error. Say so plainly instead.
+    const ei = (await db.query(`SELECT to_regclass('"EiSessionNotes"') AS n, to_regclass('"EiProgressReports"') AS r, to_regclass('"EiEvalReports"') AS e`)).rows[0];
+    const signed = [];
+    if (ei.n) signed.push(`SELECT 1 FROM "EiSessionNotes" WHERE patient_id=$1 AND (provider_signed_at IS NOT NULL OR parent_signed_at IS NOT NULL)`);
+    if (ei.r) signed.push(`SELECT 1 FROM "EiProgressReports" WHERE patient_id=$1 AND (provider_signed_at IS NOT NULL OR parent_signed_at IS NOT NULL)`);
+    if (ei.e) signed.push(`SELECT 1 FROM "EiEvalReports" WHERE patient_id=$1 AND provider_signed_at IS NOT NULL`);
+    if (signed.length && (await db.query(`SELECT EXISTS (${signed.join(' UNION ALL ')}) AS any`, [id])).rows[0].any) {
+      return json(409, {
+        error: 'This patient has signed EI records (session notes or reports) and cannot be deleted. Set their status to Off Program instead to keep their record.',
+        blocked: true,
+      });
+    }
     await db.query('DELETE FROM "Patients" WHERE id=$1', [id]);
     return json(200, { deleted: true });
   }

@@ -41,6 +41,8 @@ const powerFormRoutes = require('./routes/powerForms');
 const ifspRoutes = require('./routes/ifsp');
 const sessionNoteRoutes = require('./routes/sessionNotes');
 const progressReportRoutes = require('./routes/progressReports');
+const evalReportRoutes = require('./routes/evalReports');
+const complianceRoutes = require('./routes/compliance');
 const developerRoutes = require('./routes/developer');
 const audit = require('./lib/audit');
 
@@ -50,7 +52,7 @@ const audit = require('./lib/audit');
 // but grouping stays roughly domain-by-domain for readability.
 const ROUTE_MODULES = [
   staffRoutes, providerRoutes, patientRoutes, appointmentRoutes,
-  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes, powerFormRoutes, ifspRoutes, sessionNoteRoutes, progressReportRoutes, developerRoutes,
+  oooRoutes, taskRoutes, chatRoutes, documentRoutes, timeOffRoutes, officeHoursRoutes, supportRoutes, waitlistRoutes, auditLogRoutes, billingRoutes, eiHubRoutes, powerFormRoutes, ifspRoutes, sessionNoteRoutes, progressReportRoutes, evalReportRoutes, complianceRoutes, developerRoutes,
 ];
 
 // Which scheduled job an EventBridge event is for: its `job` (a rule with a
@@ -162,6 +164,13 @@ async function handleRequest(event) {
     if (path.startsWith('/forms/')) {
       const formResult = await powerFormRoutes.handlePublic({ path, method, body, db, meta: audit.requestMeta(event) });
       if (formResult) return formResult;
+    }
+
+    // EI session notes: a telehealth parent signs from a secure link
+    // (routes/sessionNotes.js handlePublic; PedsDesk's "ei" feature only).
+    if (path.startsWith('/sign/')) {
+      const signResult = await sessionNoteRoutes.handlePublic({ path, method, body, db, meta: audit.requestMeta(event) });
+      if (signResult) return signResult;
     }
 
     if (!currentUser) {

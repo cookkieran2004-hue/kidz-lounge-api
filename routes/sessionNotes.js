@@ -7,13 +7,24 @@
 //   POST /session-notes/note/parent-sign               { key, parent_name, relationship, note_signature, log_signature }
 //   POST /session-notes/note/provider-sign             { key, signature, license }
 //   POST /session-notes/note/addenda                   { key, body } (after a signature)
+//   POST /session-notes/note/parent-link               { key } a telehealth parent signs from a secure link (7 days)
+//   POST /session-notes/note/supervisor-sign           { key, signature, license } the supervisor's co-signature
 //   GET  /session-notes/service-log?patient_id=&provider=&month=   the month's service log rows
+//   GET  /session-notes/cosign                         notes waiting for my co-signature (the office: everyone's)
+//   GET  /session-notes/record?patient_id=             the office: a child's signed EI records for the chart's record pack
+//
+//   Public (no sign-in; index.js, like Power Forms), the parent's side of a link:
+//   GET  /sign/:token            POST /sign/:token/unlock { dob }      POST /sign/:token/submit { access, ... }
 //
 // Who: the session's own provider writes, gets the parent's signatures on
-// their device, signs and adds addenda. Reception, Admins and Developers
-// (canManage) see every note and print them, but never sign for a provider.
-// A provider sees only their own sessions.
+// their device (or sends a link), signs and adds addenda. Their supervisor
+// (Providers.supervisor_name) reads and co-signs. Reception, Admins and
+// Developers (canManage) see every note and print them, but never sign for
+// a provider. A provider sees only their own sessions.
+const jwt = require('jsonwebtoken');
 const { json } = require('../lib/http');
+const audit = require('../lib/audit');
+const { hashToken, newToken } = require('../lib/powerForms');
 const { canManage } = require('../lib/roles');
 const { featureOn } = require('../lib/features');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
@@ -24,7 +35,17 @@ const notes = require('../lib/sessionNotes');
 const { sessionKey, eiServiceFor, disciplinesOf } = require('./billing');
 
 const MIGRATION = 'Session notes need the 2026-11-05 database update. It runs with the next deploy.';
+const LINK_DAYS = 7;
+const MAX_FAILS = 5;
+const LOCK_MINUTES = 30;
 let tablesSeen = false;
+let complianceSeen = false;
+async function hasCompliance(db) {
+  if (complianceSeen) return true;
+  const r = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiSessionNotes' AND column_name = 'parent_link_hash'`);
+  complianceSeen = r.rows.length > 0;
+  return complianceSeen;
+}
 async function hasTables(db) {
   if (tablesSeen) return true;
   const r = await db.query(`SELECT to_regclass('"EiSessionNotes"') AS a, to_regclass('"EiSessionNoteAddenda"') AS b`);
@@ -55,7 +76,8 @@ async function eiSessionsFor(db, { month, provider, patientName }) {
   const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
   const out = (a) => ooo.some(o => o.provider === a.provider && day10(o.ooo_date) === day10(a.appointment_date)
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
-  const real = appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name) && a.patient_name && a.provider
+  // An evaluation takes an evaluation report, not a session note.
+  const real = appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name) && a.patient_name && a.provider && !a.is_eval
     && (!closed.has(day10(a.appointment_date)) || a.outside_hours) && !out(a));
   const names = [...new Set(real.map(a => a.patient_name))];
   const patients = names.length ? (await db.query('SELECT id, "Name", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows : [];
@@ -78,6 +100,13 @@ async function eiSessionsFor(db, { month, provider, patientName }) {
     });
   }
   return rows.sort((x, y) => x.date.localeCompare(y.date) || x.start_time.localeCompare(y.start_time));
+}
+
+// What the browser sees of a note: never the link's hash.
+function shown(note) {
+  if (!note) return null;
+  const { parent_link_hash, parent_link_failures, parent_link_locked_until, ...rest } = note;
+  return { ...rest, parent_link_open: !!(parent_link_hash && note.parent_link_expires && new Date(note.parent_link_expires) > new Date() && !note.parent_signed_at) };
 }
 
 async function loadNote(db, key) {
@@ -127,26 +156,82 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, { month, provider: qs.provider, agency_name: agency?.agency_name || null, rows });
   }
 
+  if (path === '/session-notes/cosign' && method === 'GET') {
+    if (!(await hasCompliance(db))) return json(200, { notes: [] });
+    const rows = (await db.query(
+      `SELECT n.id, n.session_key, n.session_date, n.start_time, n.provider, n.service, n.supervisor_name, n.provider_signed_at, p."Name" AS patient_name
+       FROM "EiSessionNotes" n JOIN "Patients" p ON p.id = n.patient_id
+       WHERE n.supervisor_name IS NOT NULL AND n.supervisor_signed_at IS NULL AND n.provider_signed_at IS NOT NULL
+         AND ($1::text IS NULL OR n.supervisor_name = $1) ORDER BY n.provider_signed_at`, [manager && !qs.mine ? null : own]
+    )).rows;
+    return json(200, { cosign_days: notes.COSIGN_DAYS, notes: rows });
+  }
+
+  // The chart's record pack (the office): every signed note with its
+  // addenda, the progress reports and evaluation reports to fetch, and the
+  // documents on file (listed, not merged). The browser builds the PDF.
+  if (path === '/session-notes/record' && method === 'GET') {
+    if (!manager) return json(403, { error: 'Record packs are made by Reception, Admins and Developers.' });
+    const patientId = String(qs.patient_id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(patientId)) return json(400, { error: 'Choose a child.' });
+    const list = (await db.query(
+      `SELECT * FROM "EiSessionNotes" WHERE patient_id=$1 AND (provider_signed_at IS NOT NULL OR parent_signed_at IS NOT NULL) ORDER BY session_date, start_time`, [patientId]
+    )).rows;
+    const addenda = list.length ? (await db.query('SELECT * FROM "EiSessionNoteAddenda" WHERE note_id = ANY($1) ORDER BY signed_at, id', [list.map(n => n.id)])).rows : [];
+    const has = (await db.query(`SELECT to_regclass('"EiProgressReports"') AS r, to_regclass('"EiEvalReports"') AS e`)).rows[0];
+    const reports = has.r ? (await db.query('SELECT id FROM "EiProgressReports" WHERE patient_id=$1 AND (provider_signed_at IS NOT NULL OR parent_signed_at IS NOT NULL) ORDER BY ifsp_start, id', [patientId])).rows : [];
+    const evals = has.e ? (await db.query('SELECT session_key FROM "EiEvalReports" WHERE patient_id=$1 AND provider_signed_at IS NOT NULL ORDER BY eval_date', [patientId])).rows : [];
+    const documents = (await db.query('SELECT id, filename, document_type, uploaded_at FROM "PatientDocuments" WHERE patient_id=$1 ORDER BY uploaded_at', [patientId])).rows;
+    const agency = (await db.query('SELECT agency_name FROM "EiBillingSettings" WHERE id = 1').catch(() => ({ rows: [] }))).rows[0];
+    return json(200, {
+      agency_name: agency?.agency_name || null,
+      notes: list.map(n => ({ note: shown(n), addenda: addenda.filter(a => a.note_id === n.id) })),
+      progress_report_ids: reports.map(r => r.id),
+      eval_keys: evals.map(e => e.session_key),
+      documents,
+    });
+  }
+
   if (!path.startsWith('/session-notes/note')) return json(404, { error: 'Not found.' });
   const key = String((method === 'GET' ? qs.key : body?.key) || '');
   const appt = await notes.findSession(db, key);
   if (!appt) return json(404, { error: 'That session was not found. It may have been moved or deleted.' });
   const info = await notes.sessionInfo(db, appt);
+  if (info.eval) return json(400, { error: 'This is an evaluation: write an evaluation report for it instead of a session note.' });
   if (!info.ei) return json(400, { error: "This session doesn't bill under EI, so it doesn't take an EI session note." });
-  const mine = own && info.provider === own;
-  if (!manager && !mine) return json(403, { error: 'You can only see notes for your own sessions.' });
   if (info.date > clinicToday()) return json(400, { error: 'A session note can be written on or after the day of the session.' });
   let { note, addenda } = await loadNote(db, key);
+  const mine = own && info.provider === own;
+  const supervising = !!own && !mine && (note?.supervisor_name === own || (!note?.provider_signed_at && info.supervisor === own));
+  if (!manager && !mine && !supervising) return json(403, { error: 'You can only see notes for your own sessions.' });
 
   if (path === '/session-notes/note' && method === 'GET') {
     const { patient, ...session } = info;
     return json(200, {
       session: { ...session, patient_id: patient.id, patient_name: patient.Name },
-      note, addenda, can_write: !!mine,
+      note: shown(note), addenda, can_write: !!mine,
+      can_cosign: !!(supervising && note?.supervisor_name === own && note.provider_signed_at && !note.supervisor_signed_at),
+      cosign_days: notes.COSIGN_DAYS,
       status: notes.noteStatus(note),
       missing: notes.missingForSigning(note || { cancelled: info.cancelled }),
       today: clinicToday(),
     });
+  }
+
+  if (path === '/session-notes/note/supervisor-sign' && method === 'POST') {
+    if (!note || !note.supervisor_name || note.supervisor_name !== own) return json(403, { error: "Only the provider's supervisor can co-sign this note." });
+    if (!note.provider_signed_at) return json(400, { error: 'The provider signs the note first.' });
+    if (note.supervisor_signed_at) return json(409, { error: 'You have already co-signed this note.' });
+    const b = body || {};
+    if (!notes.validSignature(b.signature)) return json(400, { error: 'Sign in the box.' });
+    const license = String(b.license || (await notes.licenseFor(db, own)) || '').trim().slice(0, 60);
+    if (!license) return json(400, { error: 'Enter your license #.' });
+    note = (await db.query(
+      `UPDATE "EiSessionNotes" SET supervisor_signature=$1, supervisor_license=$2, supervisor_signed_at=now(), supervisor_signed_by=$3, updated_at=now()
+       WHERE id=$4 AND supervisor_signed_at IS NULL RETURNING *`, [b.signature, license, currentUser.username, note.id]
+    )).rows[0];
+    if (!note) return json(409, { error: 'This note was already co-signed. Reload the page.' });
+    return json(200, { note: shown(note), status: notes.noteStatus(note) });
   }
 
   // Everything below writes: only the session's own provider.
@@ -165,6 +250,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
           value.location, value.delivery, value.participants, value.participants_other, value.outcome_ids, value.outcomes_text, value.narrative,
           value.parent_methods, value.parent_methods_other, value.strategies, currentUser.username]
       )).rows[0];
+      if (await hasCompliance(db)) note = await saveGroup(db, note.id, value);
     } else {
       // The session's own details follow the schedule until the first
       // signature (a time or status changed after the draft was started).
@@ -176,8 +262,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
           value.location, value.delivery, value.participants, value.participants_other, value.outcome_ids, value.outcomes_text, value.narrative,
           value.parent_methods, value.parent_methods_other, value.strategies, note.id]
       )).rows[0];
+      // A change after a link went to the parent cancels the link: they'd
+      // otherwise sign something they never saw.
+      if (await hasCompliance(db)) note = await saveGroup(db, note.id, value, true);
     }
-    return json(200, { note, status: notes.noteStatus(note), missing: notes.missingForSigning(note) });
+    return json(200, { note: shown(note), status: notes.noteStatus(note), missing: notes.missingForSigning(note) });
   }
 
   if (path === '/session-notes/note/parent-sign' && method === 'POST') {
@@ -198,7 +287,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        WHERE id=$5 AND parent_signed_at IS NULL RETURNING *`, [name, relationship, b.note_signature, b.log_signature, note.id]
     )).rows[0];
     if (!note) return json(409, { error: 'The parent has already signed this note. Reload the page.' });
-    return json(200, { note, status: notes.noteStatus(note) });
+    if (await hasCompliance(db)) note = (await db.query(`UPDATE "EiSessionNotes" SET parent_signed_via='device', parent_link_hash=NULL WHERE id=$1 RETURNING *`, [note.id])).rows[0];
+    return json(200, { note: shown(note), status: notes.noteStatus(note) });
   }
 
   if (path === '/session-notes/note/provider-sign' && method === 'POST') {
@@ -216,7 +306,27 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       [b.signature, license, currentUser.username, { ...info.header, license, outcomes: info.outcomes.filter(o => (note.outcome_ids || []).includes(o.id)) }, note.id]
     )).rows[0];
     if (!note) return json(409, { error: 'This note was already signed. Reload the page.' });
-    return json(200, { note, status: notes.noteStatus(note) });
+    // Their supervisor at the time of signing co-signs it.
+    if (info.supervisor && (await hasCompliance(db))) {
+      note = (await db.query('UPDATE "EiSessionNotes" SET supervisor_name=$1 WHERE id=$2 RETURNING *', [info.supervisor, note.id])).rows[0];
+    }
+    return json(200, { note: shown(note), status: notes.noteStatus(note) });
+  }
+
+  if (path === '/session-notes/note/parent-link' && method === 'POST') {
+    if (!(await hasCompliance(db))) return json(503, { error: 'Signing links need the 2026-11-07 database update. It runs with the next deploy.' });
+    if (!note) return json(400, { error: 'Save the note first.' });
+    if (note.cancelled) return json(400, { error: "A canceled session doesn't need the parent's signature." });
+    if (note.parent_signed_at) return json(409, { error: 'The parent has already signed this note.' });
+    if (note.delivery !== 'telehealth') return json(400, { error: 'A signing link is for telehealth sessions. For an in-person session the parent signs on your device.' });
+    const missing = notes.missingForSigning(note);
+    if (missing.length) return json(400, { error: `Finish the note before sending it: ${missing[0]}.`, missing });
+    const token = newToken();
+    await db.query(
+      `UPDATE "EiSessionNotes" SET parent_link_hash=$1, parent_link_expires=now() + ($2::text || ' days')::interval, parent_link_failures=0, parent_link_locked_until=NULL WHERE id=$3`,
+      [hashToken(token), String(LINK_DAYS), note.id]
+    );
+    return json(200, { token, path: `/s/${token}`, expires_days: LINK_DAYS });
   }
 
   if (path === '/session-notes/note/addenda' && method === 'POST') {
@@ -233,4 +343,96 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   return json(405, { error: 'Not supported.' });
 }
 
-module.exports = { handle, eiSessionsFor };
+// The group-session fields (and, on a change, cancelling an open link).
+async function saveGroup(db, id, v, changed) {
+  return (await db.query(
+    `UPDATE "EiSessionNotes" SET group_type=$1, group_children=$2, group_duration=$3, group_site=$4, aide_name=$5, aide_notes=$6,
+       parent_link_hash=CASE WHEN $7::boolean THEN NULL ELSE parent_link_hash END WHERE id=$8 RETURNING *`,
+    [v.group_type, v.group_children, v.group_duration, v.group_site, v.aide_name, v.aide_notes, !!changed, id]
+  )).rows[0];
+}
+
+// ---------- Public: a telehealth parent signs from a link ----------
+const accessSecret = () => `${process.env.JWT_SECRET}:session-sign`;
+const NOT_VALID = "This link isn't valid. Ask your provider to send you a new one.";
+
+async function handlePublic({ path, method, body, db, meta }) {
+  const m = path.match(/^\/sign\/([^/]+)(?:\/(unlock|submit))?$/);
+  if (!m) return null;
+  if (!featureOn('ei') || !(await hasTables(db)) || !(await hasCompliance(db))) return json(404, { error: NOT_VALID });
+  if (!/^[A-Za-z0-9_-]{30,80}$/.test(m[1])) return json(404, { error: NOT_VALID });
+  const note = (await db.query('SELECT * FROM "EiSessionNotes" WHERE parent_link_hash=$1', [hashToken(m[1])])).rows[0];
+  if (!note) return json(404, { error: NOT_VALID });
+  if (note.parent_signed_at) return json(200, { status: 'completed' });
+  if (!note.parent_link_expires || new Date(note.parent_link_expires) < new Date()) {
+    return json(410, { status: 'expired', error: 'This link has expired. Ask your provider to send you a new one.' });
+  }
+  if (note.parent_link_locked_until && new Date(note.parent_link_locked_until) > new Date()) {
+    const mins = Math.max(1, Math.ceil((new Date(note.parent_link_locked_until) - new Date()) / 60000));
+    return json(429, { status: 'locked', error: `Too many tries. Please try again in ${mins} minute${mins === 1 ? '' : 's'}.` });
+  }
+  const b = body || {};
+  if (!m[2] && method === 'GET') return json(200, { status: 'ready' });
+
+  const patient = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [note.patient_id])).rows[0];
+  if (m[2] === 'unlock' && method === 'POST') {
+    const real = patient?.Date_of_Birth ? String(patient.Date_of_Birth).slice(0, 10) : null;
+    if (!real || String(b.dob || '').slice(0, 10) !== real) {
+      const fails = note.parent_link_failures + 1;
+      const lock = fails >= MAX_FAILS;
+      await db.query(
+        `UPDATE "EiSessionNotes" SET parent_link_failures=$1::int,
+           parent_link_locked_until=CASE WHEN $2::boolean THEN now() + ($3::text || ' minutes')::interval ELSE parent_link_locked_until END WHERE id=$4`,
+        [lock ? 0 : fails, lock, String(LOCK_MINUTES), note.id]
+      );
+      if (lock) return json(429, { status: 'locked', error: `Too many tries. Please try again in ${LOCK_MINUTES} minutes.` });
+      return json(400, { error: "That date of birth doesn't match our records. Please check it and try again." });
+    }
+    await db.query('UPDATE "EiSessionNotes" SET parent_link_failures=0 WHERE id=$1', [note.id]);
+    const access = jwt.sign({ nid: note.id }, accessSecret(), { expiresIn: '2h' });
+    // Only what the parent is signing: the session and the note's answers.
+    const ifspOutcomes = note.outcome_ids?.length
+      ? (await db.query('SELECT id, outcome FROM "EiIfspOutcomes" WHERE id = ANY($1) ORDER BY position, id', [note.outcome_ids])).rows : [];
+    return json(200, {
+      access,
+      session: {
+        child_first_name: String(patient.Name || '').trim().split(/\s+/)[0] || null,
+        date: day10(note.session_date), start_time: String(note.start_time).slice(0, 5), end_time: String(note.end_time).slice(0, 5),
+        service: note.service, provider: note.provider, delivery: note.delivery,
+      },
+      note: {
+        outcomes: ifspOutcomes.map(o => o.outcome), outcomes_text: note.outcomes_text, narrative: note.narrative,
+        parent_methods: note.parent_methods, parent_methods_other: note.parent_methods_other, strategies: note.strategies, group_type: note.group_type,
+      },
+      parent_hint: { name: patient.Parent_Name || null, relationship: patient.Relationship_To_Patient || null },
+    });
+  }
+
+  if (m[2] === 'submit' && method === 'POST') {
+    let claims = null;
+    try { claims = jwt.verify(String(b.access || ''), accessSecret()); } catch { claims = null; }
+    if (!claims || claims.nid !== note.id) return json(401, { error: 'Your session ran out. Reload the page and enter the date of birth again.' });
+    const name = String(b.parent_name || '').trim().slice(0, 200);
+    const relationship = String(b.relationship || '').trim().slice(0, 100);
+    if (!name) return json(400, { error: 'Enter your name.' });
+    if (!relationship) return json(400, { error: 'Enter your relationship to the child.' });
+    if (!notes.validSignature(b.note_signature)) return json(400, { error: 'Sign the session note in the box.' });
+    if (!notes.validSignature(b.log_signature)) return json(400, { error: 'Sign the service log in the box.' });
+    const done = (await db.query(
+      `UPDATE "EiSessionNotes" SET parent_name=$1, parent_relationship=$2, parent_note_signature=$3, parent_log_signature=$4, parent_signed_at=now(),
+         parent_signed_via='link', parent_link_hash=NULL, updated_at=now()
+       WHERE id=$5 AND parent_signed_at IS NULL AND parent_link_hash=$6 RETURNING id`,
+      [name, relationship, b.note_signature, b.log_signature, note.id, hashToken(m[1])]
+    )).rows[0];
+    if (!done) return json(409, { error: 'This note was already signed.' });
+    await audit.record(db, {
+      username: null, role: 'parent', action: 'create', resource: 'Session note signature', patientId: note.patient_id,
+      recordId: note.id, method, path: '/sign/:token/submit', status: 200, ip: meta.ip, userAgent: meta.userAgent,
+      details: { session_date: day10(note.session_date), provider: note.provider },
+    });
+    return json(200, { status: 'completed' });
+  }
+  return null;
+}
+
+module.exports = { handle, handlePublic, eiSessionsFor };
