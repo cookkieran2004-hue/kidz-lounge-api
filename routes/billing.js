@@ -67,8 +67,6 @@ function settingOf(area) {
   if (!m) return 'C';
   return m[1] ? SETTING_LETTER[m[1][0].toUpperCase() + m[1].slice(1).toLowerCase()] : '';
 }
-// Every setting used in a row, in C, S, H order: "C, S".
-const joinSettings = (set) => ['C', 'S', 'H'].filter(x => set.has(x)).join(', ');
 
 async function buildSheet(db, provider, month) {
   const start = `${month}-01`;
@@ -109,7 +107,10 @@ async function buildSheet(db, provider, month) {
   // Which program (and mandate) each session bills under: the patient's
   // program history on the session's date, for this provider's discipline
   // (lib/patientPrograms.js). A child whose program or mandate changed
-  // during the month gets a row for each. Before that migration, or for a
+  // during the month gets a row for each, and so does each setting (Kieran,
+  // Oct 15 2026: a child seen at the center and at home is one line for C
+  // and one for H; sessions with no setting get their own blank line, to
+  // fix). Before that migration, or for a
   // patient with no history, their current Program / Mandate.
   const services = disciplinesOf(providerRes.rows[0]?.specialty);
   const history = await patientPrograms.historyFor(db, patients.map(p => p.id));
@@ -122,27 +123,25 @@ async function buildSheet(db, provider, month) {
   const rowMap = new Map();
   // An insurance / P / PP program shows as its billing code (C-1 ... C-#);
   // with none entered yet, its name plus needs_code (a red # on the sheet).
-  const rowFor = (name, program, mandate, code = null) => {
+  const rowFor = (name, program, mandate, code = null, setting = '') => {
     const coded = program && String(program).split(',').some(x => patientPrograms.takesBillingCode(x.trim()));
     const shown = coded && code ? code : program;
-    const key = `${name}\u0000${shown || ''}\u0000${mandate || ''}`;
+    const key = `${name}\u0000${shown || ''}\u0000${mandate || ''}\u0000${setting}`;
     if (!rowMap.has(key)) {
-      rowMap.set(key, { patient_name: name, mandate, program: shown, needs_code: !!(coded && !code), group: groupFor(program), pay_group: payGroupFor(program), setting: '', settings: new Set(), days: {}, scheduled: 0, total_sessions: 0 });
+      rowMap.set(key, { patient_name: name, mandate, program: shown, needs_code: !!(coded && !code), group: groupFor(program), pay_group: payGroupFor(program), setting, days: {}, scheduled: 0, total_sessions: 0 });
     }
     return rowMap.get(key);
   };
   for (const a of appts) {
     const date = String(a.appointment_date).slice(0, 10);
     const { program, mandate, code } = billAs(a.patient_name, date);
-    const row = rowFor(a.patient_name, program, mandate, code);
+    const row = rowFor(a.patient_name, program, mandate, code, settingOf(a.treatment_area) || '');
     const d = Number(date.slice(8, 10));
     const mark = markFor(a);
     if (mark === 'X' || mark === 'M' || mark === 'E') row.total_sessions += 1;
     // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
     // is a make-up -- the canceled session it replaces already was.
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
-    const letter = settingOf(a.treatment_area);
-    if (letter) { row.settings.add(letter); row.setting = joinSettings(row.settings); }
     (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id, outside_hours: !!a.outside_hours, duration: Number(a.duration) || 30 });
   }
   // On the caseload with no sessions this month (booked later on): their program today.
@@ -151,9 +150,18 @@ async function buildSheet(db, provider, month) {
     const { program, mandate, code } = billAs(name, today);
     rowFor(name, program, mandate, code);
   }
-  for (const row of rowMap.values()) delete row.settings; // not sent
+  // By name; a child's program / mandate periods by their first day; within
+  // one, the settings in C, S, H order, then the line with no setting.
+  const firstDay = (r) => Number(Object.keys(r.days)[0] || 99);
+  const periodStart = new Map();
+  for (const r of rowMap.values()) {
+    const k = `${r.patient_name}\u0000${r.program || ''}\u0000${r.mandate || ''}`;
+    periodStart.set(k, Math.min(periodStart.get(k) ?? 99, firstDay(r)));
+  }
+  const startOf = (r) => periodStart.get(`${r.patient_name}\u0000${r.program || ''}\u0000${r.mandate || ''}`);
+  const SETTING_ORDER = { C: 0, S: 1, H: 2, '': 3 };
   const rows = [...rowMap.values()].sort((a, b) => a.patient_name.localeCompare(b.patient_name)
-    || (Object.keys(a.days)[0] || 99) - (Object.keys(b.days)[0] || 99));
+    || startOf(a) - startOf(b) || SETTING_ORDER[a.setting] - SETTING_ORDER[b.setting]);
 
   let reviewed = null;
   if (await hasTable(db, 'BillingReviews')) {
