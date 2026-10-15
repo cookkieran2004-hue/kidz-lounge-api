@@ -3,6 +3,10 @@ const { canAdminister } = require('../lib/roles');
 const { HttpError, assertNameAvailable, cascadeProviderRename } = require('../lib/providerNames');
 const { typeOf } = require('../lib/credentialTypes');
 
+// How long a provider whose staff account was archived stays in the
+// provider directory (Kieran, Oct 2026).
+const ARCHIVED_DIRECTORY_DAYS = 60;
+
 async function handle({ path, method, qs, body, db, currentUser }) {
   // A provider counts as archived when their staff account is archived
   // (and no active account is linked). By default they're left out, so
@@ -36,12 +40,15 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/providers/directory' && method === 'GET') {
     // Staff.date_of_birth (2026-10-31_staff_dob.sql), when it exists.
     const hasDob = async (q) => (await q.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Staff' AND column_name = 'date_of_birth'`)).rows.length > 0;
+    // Staff.archived_at (2026-11-09_staff_archived_at.sql), when it exists.
+    const hasArchivedAt = (await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'Staff' AND column_name = 'archived_at'`)).rows.length > 0;
     const providers = (await db.query(`
       SELECT p.id, p."Name" AS name, p.credentials, p.specialty, p.npi,
-             s.username, s.phone, s.email, s.archived, s.dob
+             s.username, s.phone, s.email, s.archived, s.dob, s.recently_archived
       FROM "Providers" p
       LEFT JOIN LATERAL (
-        SELECT username, phone, email, archived, ${(await hasDob(db)) ? 'to_char(date_of_birth, \'MM-DD\')' : 'NULL'} AS dob
+        SELECT username, phone, email, archived, ${(await hasDob(db)) ? 'to_char(date_of_birth, \'MM-DD\')' : 'NULL'} AS dob,
+               ${hasArchivedAt ? `(archived AND archived_at > now() - interval '${ARCHIVED_DIRECTORY_DAYS} days')` : 'false'} AS recently_archived
         FROM "Staff" WHERE provider_name = p."Name" ORDER BY archived, id LIMIT 1
       ) s ON true
       ORDER BY lower(p."Name")`)).rows;
@@ -57,16 +64,18 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       if (t === 'License Number') license[c.username] = { v, rank: 2 };
       else if (t === 'License/Registration' && !(license[c.username]?.rank > 1)) license[c.username] = { v, rank: 1 };
     }
-    // Archived providers (their only staff account is archived) are left out
-    // entirely (Kieran, Oct 2026). Providers who never had an account still
-    // show, as not current.
-    return json(200, providers.filter(p => !(p.username && p.archived)).map(p => ({
+    // Archived providers (their only staff account is archived) show for
+    // ARCHIVED_DIRECTORY_DAYS after they were archived, marked `archived`,
+    // then drop off (Kieran, Oct 2026; before the migration they're left out).
+    // Providers who never had an account still show, as not current.
+    return json(200, providers.filter(p => !(p.username && p.archived && !p.recently_archived)).map(p => ({
       id: p.id, name: p.name, credentials: p.credentials || null, discipline: p.specialty || null, npi: p.npi || null,
       phone: p.phone || null, email: p.email || null,
       license_number: p.username ? license[p.username]?.v || null : null,
       // Month and day only ('MM-DD'), like the office's list.
       birthday: p.dob || null,
       current: !!p.username && !p.archived,
+      archived: !!(p.username && p.archived),
     })));
   }
 

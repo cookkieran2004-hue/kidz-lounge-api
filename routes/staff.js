@@ -125,7 +125,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/credentials/overview' && method === 'GET') {
     if (!canManage(currentUser)) return json(403, { error: CREDENTIALS_DENIED });
     const [staffRes, offsite] = await Promise.all([
-      db.query('SELECT username, first_name, middle_name, last_name, preferred_name, role, provider_name, position FROM "Staff" WHERE archived = false'),
+      // Developers aren't office staff, so they're not on the Credentials
+      // page (Kieran, Oct 2026).
+      db.query(`SELECT username, first_name, middle_name, last_name, preferred_name, role, provider_name, position FROM "Staff" WHERE archived = false AND role <> 'developer'`),
       offsiteProviders(db),
     ]);
     const usernames = [...staffRes.rows, ...offsite].map(s => s.username);

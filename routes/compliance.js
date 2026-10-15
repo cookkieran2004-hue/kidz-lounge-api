@@ -189,7 +189,7 @@ async function credentialsSection(db, today) {
   const rows = (await db.query(
     `SELECT c.credential_name, c.expiration_date, s.username, s.first_name, s.last_name, s.preferred_name, s.provider_name
      FROM "StaffCredentials" c JOIN "Staff" s ON s.username = c.username
-     WHERE s.archived = false AND c.expiration_date IS NOT NULL AND c.expiration_date <= $1 ORDER BY c.expiration_date`, [ifspLib.addDays(today, LOOK_AHEAD_DAYS)]
+     WHERE s.archived = false AND s.role <> 'developer' AND c.expiration_date IS NOT NULL AND c.expiration_date <= $1 ORDER BY c.expiration_date`, [ifspLib.addDays(today, LOOK_AHEAD_DAYS)]
   )).rows;
   return rows.map(c => {
     const date = day10(c.expiration_date);

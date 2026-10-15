@@ -2,6 +2,15 @@ const { json } = require('../lib/http');
 const { canManage } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 
+// Developers can't be given tasks by anyone else; people message them in
+// chat instead (Kieran, Oct 2026). A developer can still make their own.
+// The system's automatic tasks already skip developers (getsPatientTasks).
+const DEVELOPER_TASK_REFUSED = 'Tasks can\'t be assigned to a Developer. Send them a message in chat instead.';
+async function developersAmong(db, usernames) {
+  if (!usernames.length) return false;
+  return (await db.query(`SELECT 1 FROM "Staff" WHERE username = ANY($1) AND role = 'developer' LIMIT 1`, [usernames])).rows.length > 0;
+}
+
 async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/tasks' && method === 'GET') {
     // Everyone can see their own tasks. An admin can look up someone
@@ -54,6 +63,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (assignees.some(u => u !== currentUser.username) && !canManage(currentUser)) {
       return json(403, { error: 'Only an admin can assign a task to someone else.' });
     }
+    if (await developersAmong(db, assignees.filter(u => u !== currentUser.username))) return json(400, { error: DEVELOPER_TASK_REFUSED });
     const client = await db.connect();
     try {
       await client.query('BEGIN');
@@ -105,6 +115,9 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
     if (assigned_to && assigned_to !== existingTask.assigned_to && !isAdmin) {
       return json(403, { error: 'Only an admin can reassign a task.' });
+    }
+    if (assigned_to && assigned_to !== existingTask.assigned_to && assigned_to !== currentUser.username && await developersAmong(db, [assigned_to])) {
+      return json(400, { error: DEVELOPER_TASK_REFUSED });
     }
 
     let completedAt = existingTask.completed_at;
