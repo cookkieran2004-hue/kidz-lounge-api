@@ -340,7 +340,9 @@ async function chartRoutes({ path, method, body, db, currentUser }) {
   if ((path === '/ei-hub/import/preview' || path === '/ei-hub/import/apply') && method === 'POST') {
     if (!canManage(currentUser)) return json(403, { error: 'Only Reception, Admins and Developers can import from EI-Hub.' });
     if (!(await hasSetup(db))) return json(409, { error: MIGRATION });
-    const deps = { cleanChild, cleanReferral, mirrorChild, hasAuthTable: await hasAuthTable(db), authMigration: AUTH_MIGRATION };
+    const deps = { cleanChild, cleanReferral, mirrorChild, hasAuthTable: await hasAuthTable(db), authMigration: AUTH_MIGRATION,
+      // EiAuthorizations.source (2026-11-10): an import replaces a hand-entered auth.
+      hasAuthSource: (await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiAuthorizations' AND column_name = 'source'`)).rows.length > 0 };
     if (path === '/ei-hub/import/preview') {
       const p = await eiImport.preview(db, body, deps);
       if (p.error) return json(400, { error: p.error });
