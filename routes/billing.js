@@ -47,7 +47,8 @@ function groupFor(program) {
 // Who pays, for the totals under the sheet (Kieran, Oct 2026): EI, DOE,
 // Insurance (BCBS/Anthem, CIGNA, GHI, and private pay P / PP) or Other (no
 // program). The table's sections stay EI / DOE / Other.
-const INSURANCE_PROGRAMS = new Set(['BCBS/ANTHEM', 'BCBS/ANTHEN', 'CIGNA', 'GHI', 'P', 'PP']);
+// 'INSURANCE' / 'PRIVATE PAY': PedsDesk's generic names for the same (Oct 2026).
+const INSURANCE_PROGRAMS = new Set(['BCBS/ANTHEM', 'BCBS/ANTHEN', 'CIGNA', 'GHI', 'P', 'PP', 'INSURANCE', 'PRIVATE PAY']);
 function payGroupFor(program) {
   const group = groupFor(program);
   if (group !== 'Other') return group;
