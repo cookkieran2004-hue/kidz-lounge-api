@@ -267,7 +267,7 @@ async function eiHubSessions(db, month) {
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   const appts = apptsAll.filter(a => {
     const date = day10(a.appointment_date);
-    return date < today && (!closed.has(date) || a.outside_hours)
+    return date < today && !closed.has(date)
       && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
       && a.appointment_status !== 'Canceled' && a.appointment_status !== 'No Show'
       && !providerOut(a);

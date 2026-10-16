@@ -309,6 +309,80 @@ async function handle(ctx) {
     return json(200, result.rows[0]);
   }
 
+  // A new setting (treatment_area) for a series from one occurrence on
+  // (Kieran, Oct 15 2026: Center / School / Home "this and all future"). The
+  // series ends the day before and a copy starts on from_date with the new
+  // area; its later one-off rows (exceptions) move to the copy, so they
+  // neither duplicate nor lose their deleted markers, and the ones that had
+  // the series' old area take the new one (a deliberate one-off room keeps
+  // its own). from_date on the series' first day just changes it in place.
+  // Refused when sessions from that date on are signed or already in EI-Hub
+  // (their records are keyed by this series).
+  if (path.match(/^\/recurring-series\/[^/]+\/split$/) && method === 'POST') {
+    const seriesId = path.split('/')[2];
+    const from = String(body.from_date || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) return json(400, { error: 'from_date is required.' });
+    const area = body.treatment_area ? String(body.treatment_area).slice(0, 200) : null;
+    const series = (await db.query('SELECT * FROM "RecurringSeries" WHERE id::text=$1', [seriesId])).rows[0];
+    if (!series) return json(404, { error: 'Series not found.' });
+    const start = String(series.start_date).slice(0, 10);
+    const end = series.end_date ? String(series.end_date).slice(0, 10) : null;
+    if (from < start || (end && from > end)) return json(400, { error: 'That date is outside the series.' });
+    const inPlace = from === start;
+    if (!inPlace) {
+      const lock = await signedSeriesFrom(db, series.id, from);
+      if (lock) {
+        const on = (JSON.parse(lock.body).error.match(/from (\d{4}-\d{2}-\d{2})/) || [])[1] || from;
+        return json(409, { error: `Sessions of this series from ${on} on have signed session notes, so the change can't start before them. Change it from a later session, or just this one.`, locked: true });
+      }
+      if ((await db.query(`SELECT to_regclass('"EiHubEntries"') AS t`)).rows[0]?.t) {
+        const entered = (await db.query(`SELECT session_key FROM "EiHubEntries" WHERE session_key LIKE $1 AND split_part(session_key, ':', 3) >= $2 LIMIT 1`, [`series:${series.id}:%`, from])).rows[0];
+        if (entered) return json(409, { error: `The session on ${entered.session_key.split(':')[2]} is already entered in EI-Hub, so the series can't be split from ${from}. Change it from a later session, or just this one.` });
+      }
+    }
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      let target = series;
+      if (inPlace) {
+        target = (await client.query('UPDATE "RecurringSeries" SET treatment_area=$1, updated_at=now() WHERE id=$2 RETURNING *', [area, series.id])).rows[0];
+      } else {
+        const dayBefore = (() => { const d = new Date(`${from}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
+        await client.query('UPDATE "RecurringSeries" SET end_date=$1, updated_at=now() WHERE id=$2', [dayBefore, series.id]);
+        // Every column of the series, so newer ones (outside_hours...) come along.
+        const cols = Object.keys(series).filter(c => !['id', 'created_at', 'updated_at', 'start_date', 'treatment_area'].includes(c));
+        const values = cols.map(c => series[c]);
+        target = (await client.query(
+          `INSERT INTO "RecurringSeries" (${[...cols, 'start_date', 'treatment_area'].map(c => `"${c}"`).join(', ')})
+           VALUES (${[...cols, 'x', 'y'].map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
+          [...values, from, area]
+        )).rows[0];
+      }
+      const moved = await client.query(
+        `UPDATE "Appointments" SET exception_of_series_id=$1,
+           treatment_area = CASE WHEN NOT deleted AND COALESCE(treatment_area, '') = COALESCE($4, '') THEN $5 ELSE treatment_area END,
+           updated_at=now()
+         WHERE exception_of_series_id=$2 AND exception_occurrence_date >= $3 RETURNING id`,
+        [target.id, series.id, from, series.treatment_area, area]
+      );
+      // The occurrence being edited takes the new area whatever it had.
+      if (body.occurrence_date) {
+        await client.query(
+          `UPDATE "Appointments" SET treatment_area=$1, updated_at=now()
+           WHERE exception_of_series_id=$2 AND exception_occurrence_date=$3 AND NOT deleted AND appointment_status NOT IN ('Canceled', 'No Show')`,
+          [area, target.id, String(body.occurrence_date).slice(0, 10)]
+        );
+      }
+      await client.query('COMMIT');
+      return json(200, { series: target, moved: moved.rowCount, split: !inPlace });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   // Used only by "delete this and all future" -- ending a series (above)
   // only stops NEW virtual occurrences from generating past that date. Any
   // occurrence that was already touched before the delete (a room change,
