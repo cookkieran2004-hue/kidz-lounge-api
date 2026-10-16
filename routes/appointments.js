@@ -34,9 +34,9 @@ async function signedSeriesFrom(db, seriesId, fromDate) {
 // The per-session details, after any appointment row is written. The
 // absence reason comes after the cancel reason: a closure reason clears it.
 // Canceled or No Show at the center keeps "Center" but frees the room
-// (Oct 16 2026), whatever the caller sent; School / Home stay as they are.
-// Mirrors the frontend's appointmentSetting.js areaAfterStatus.
-const areaAfterStatus = (status, area) => (MISSED_STATUSES.includes(status) && area && !isOffsiteArea(area) ? 'Center' : (area || null));
+// (Oct 16 2026), whatever the caller sent; School / Home / Virtual (not a
+// real room) stay as they are. Mirrors the frontend's appointmentSetting.js.
+const areaAfterStatus = (status, area) => (MISSED_STATUSES.includes(status) && area && !isOffsiteArea(area) && area !== 'Virtual' ? 'Center' : (area || null));
 const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts);
 
 // Positive-only cache, so booking works before the evals migration (the
