@@ -3,7 +3,7 @@ const { canManage } = require('../lib/roles');
 const { mergedField, displayNameFor } = require('../lib/utils');
 const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../lib/recurring');
 const { isHold } = require('../lib/caseload');
-const { applyCancelReason } = require('../lib/cancelReason');
+const { applyCancelReason, isOffsiteArea } = require('../lib/cancelReason');
 const { applyOutsideHours } = require('../lib/outsideHours');
 const { applyAbsenceReason } = require('../lib/absenceReason');
 const { signedRecordsFor } = require('../lib/sessionNotes');
@@ -33,6 +33,10 @@ async function signedSeriesFrom(db, seriesId, fromDate) {
 
 // The per-session details, after any appointment row is written. The
 // absence reason comes after the cancel reason: a closure reason clears it.
+// Canceled or No Show at the center keeps "Center" but frees the room
+// (Oct 16 2026), whatever the caller sent; School / Home stay as they are.
+// Mirrors the frontend's appointmentSetting.js areaAfterStatus.
+const areaAfterStatus = (status, area) => (MISSED_STATUSES.includes(status) && area && !isOffsiteArea(area) ? 'Center' : (area || null));
 const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts);
 
 // Positive-only cache, so booking works before the evals migration (the
@@ -165,7 +169,7 @@ async function handle(ctx) {
       `INSERT INTO "Appointments"
         (patient_name, provider, appointment_date, appointment_time, duration, treatment_area, appointment_status, fin, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now()) RETURNING *`,
-      [patient_name, provider, appointment_date, appointment_time, duration || 30, treatment_area || null, appointment_status || 'Scheduled', fin || null]
+      [patient_name, provider, appointment_date, appointment_time, duration || 30, areaAfterStatus(appointment_status, treatment_area), appointment_status || 'Scheduled', fin || null]
     );
     if (makeupFor !== null) {
       const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
@@ -210,7 +214,7 @@ async function handle(ctx) {
         mergedField(body, 'appointment_date', existing),
         mergedField(body, 'appointment_time', existing),
         mergedField(body, 'duration', existing),
-        mergedField(body, 'treatment_area', existing),
+        areaAfterStatus(mergedField(body, 'appointment_status', existing), mergedField(body, 'treatment_area', existing)),
         mergedField(body, 'appointment_status', existing),
         body.comments ?? null,
         id,
@@ -439,7 +443,7 @@ async function handle(ctx) {
         appointment_date || occurrence_date, // supports rescheduling this one occurrence to a different date
         appointment_time || series.appointment_time,
         duration !== undefined ? duration : series.duration,
-        treatment_area !== undefined ? treatment_area : series.treatment_area,
+        areaAfterStatus(appointment_status || series.appointment_status, treatment_area !== undefined ? treatment_area : series.treatment_area),
         appointment_status || series.appointment_status,
         seriesId,
         occurrence_date, // always the ORIGINAL slot -- this is what excludes it from future virtual generation
